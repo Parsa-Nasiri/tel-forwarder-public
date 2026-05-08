@@ -197,28 +197,32 @@ def edit_text_in_rubika(chat_id: str, message_id: str, new_text: str) -> bool:
 
 
 # ---------- Git data sync ----------
-def git_clone_data_repo(token: str, repo_full_url: str):
-    """Clone the private data repo (or pull if already exists)."""
+def git_clone_data_repo(token: str, repo_url: str):
     if DATA_REPO_DIR.exists():
         shutil.rmtree(DATA_REPO_DIR)
 
-    # Build the authenticated URL
-    # repo_full_url comes without token; we inject it.
-    # Example: https://github.com/username/repo.git
-    if repo_full_url.startswith("https://"):
-        auth_url = repo_full_url.replace("https://", f"https://x-access-token:{token}@")
-    else:
-        # fallback for other formats
-        auth_url = f"https://x-access-token:{token}@{repo_full_url}"
+    os.environ["GIT_ASKPASS"] = "/dev/null"
+    helper_script = Path("/tmp/git-cred-helper.sh")
+    helper_script.write_text(f"#!/bin/sh\necho 'username=x-access-token'\necho 'password={token}'\n")
+    os.chmod(helper_script, 0o755)
+
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", auth_url, str(DATA_REPO_DIR)],
-            check=True, capture_output=True, text=True
+            [
+                "git",
+                "-c", f"credential.helper={helper_script}",
+                "clone", "--depth", "1",
+                repo_url,
+                str(DATA_REPO_DIR),
+            ],
+            check=True, capture_output=True, text=True,
         )
-        logger.info("Data repo cloned.")
+        logger.info("Data repo cloned successfully.")
     except subprocess.CalledProcessError as e:
         logger.error(f"Clone failed: {e.stderr}")
         raise
+    finally:
+        helper_script.unlink(missing_ok=True)
 
 def git_push_data_repo():
     """Commit and push local changes back to the private repo."""
