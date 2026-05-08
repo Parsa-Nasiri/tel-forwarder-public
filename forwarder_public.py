@@ -247,22 +247,25 @@ def git_push_data_repo():
 
 # ---------- Subscriber management ----------
 def fetch_new_subscribers(known_subscribers: set) -> set:
-    """Get recent updates and add any chat_id that sent a message."""
+    """Add admin and any new chat_id from getUpdates."""
     data = _rubika_post("getUpdates", {"limit": 200})
-    if not data:
-        return known_subscribers
-
-    updates = data.get("data", {}).get("updates", [])
     new_chats = set()
-    for update in updates:
-        if update.get("type") == "NewMessage":
-            chat_id = update.get("chat_id") or update.get("new_message", {}).get("chat_id")
-            if chat_id:
-                new_chats.add(chat_id)
+
+    if data:
+        updates = data.get("data", {}).get("updates", [])
+        for update in updates:
+            if update.get("type") == "NewMessage":
+                chat_id = update.get("chat_id") or update.get("new_message", {}).get("chat_id")
+                if chat_id:
+                    new_chats.add(chat_id)
+
+    # Ensure admin is always present
+    if ADMIN_CHAT_ID:
+        new_chats.add(ADMIN_CHAT_ID)
 
     all_subscribers = known_subscribers | new_chats
     if all_subscribers != known_subscribers:
-        logger.info(f"Found {len(all_subscribers) - len(known_subscribers)} new subscriber(s). Total: {len(all_subscribers)}")
+        logger.info(f"Subscribers updated. Total: {len(all_subscribers)} (admin included)")
         save_subscribers(all_subscribers)
     return all_subscribers
 
