@@ -18,6 +18,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
 RUBIKA_BOT_TOKEN = os.environ["RUBIKA_BOT_TOKEN"]
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
 # Private data repo URL (without token) – token is provided via secret
 DATA_REPO_URL = os.environ.get("DATA_REPO_URL", "")
