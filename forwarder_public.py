@@ -86,7 +86,7 @@ def save_subscribers(subscribers: set):
         json.dump(list(subscribers), f, indent=2)
 
 
-# ---------- Rubika API (unchanged) ----------
+# ---------- Rubika API ----------
 def _rubika_post(endpoint: str, payload: dict) -> dict | None:
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/{endpoint}"
     try:
@@ -247,28 +247,134 @@ def git_push_data_repo():
 
 
 # ---------- Subscriber management ----------
-def fetch_new_subscribers(known_subscribers: set) -> set:
-    """Add admin and any new chat_id from getUpdates."""
-    data = _rubika_post("getUpdates", {"limit": 200})
+def fetch_new_subscribers(known_subscribers: set, state: dict) -> tuple[set, dict]:
+    """
+    Fetch new subscribers using getUpdates.
+    
+    According to Rubika Bot API:
+    - getUpdates returns: { "updates": [...], "next_offset_id": "..." }
+    - Each update has: type (NewMessage, StartedBot, StoppedBot, etc.), chat_id
+    - StartedBot: user started the bot → ADD chat_id
+    - StoppedBot: user stopped the bot → REMOVE chat_id
+    - NewMessage: also capture chat_id as backup
+    """
+    # Use offset_id to get only new updates since last check
+    updates_offset_id = state.get("updates_offset_id")
+    payload = {"limit": 200}
+    if updates_offset_id:
+        payload["offset_id"] = updates_offset_id
+    
+    data = _rubika_post("getUpdates", payload)
     new_chats = set()
-
+    removed_chats = set()
+    next_offset_id = updates_offset_id  # Keep current if no new offset
+    
     if data:
-        updates = data.get("data", {}).get("updates", [])
-        for update in updates:
-            if update.get("type") == "NewMessage":
-                chat_id = update.get("chat_id") or update.get("new_message", {}).get("chat_id")
-                if chat_id:
+        # Try multiple possible response formats
+        updates = None
+        if isinstance(data, dict):
+            updates = data.get("updates") or (data.get("data", {}).get("updates"))
+            next_offset_id = data.get("next_offset_id") or (data.get("data", {}).get("next_offset_id")) or updates_offset_id
+        
+        if updates:
+            for update in updates:
+                update_type = update.get("type")
+                chat_id = update.get("chat_id")
+                
+                if not chat_id:
+                    # Try to extract from nested message
+                    chat_id = (update.get("new_message", {}).get("chat_id") or 
+                              update.get("updated_message", {}).get("chat_id"))
+                
+                if not chat_id:
+                    continue
+                
+                # Handle different update types
+                if update_type == "StartedBot":
                     new_chats.add(chat_id)
-
+                    logger.info(f"🆕 StartedBot: added subscriber {chat_id}")
+                elif update_type == "StoppedBot":
+                    removed_chats.add(chat_id)
+                    logger.info(f"👋 StoppedBot: removed subscriber {chat_id}")
+                elif update_type == "NewMessage":
+                    # Capture any chat_id from messages (backup method)
+                    if chat_id not in known_subscribers and chat_id not in new_chats:
+                        new_chats.add(chat_id)
+                        logger.info(f"📨 NewMessage: discovered subscriber {chat_id}")
+    
     # Ensure admin is always present
     if ADMIN_CHAT_ID:
         new_chats.add(ADMIN_CHAT_ID)
-
+    
+    # Update the set
     all_subscribers = known_subscribers | new_chats
+    all_subscribers = all_subscribers - removed_chats
+    
+    # Update state with new offset_id
+    if next_offset_id:
+        state["updates_offset_id"] = next_offset_id
+    
     if all_subscribers != known_subscribers:
-        logger.info(f"Subscribers updated. Total: {len(all_subscribers)} (admin included)")
+        logger.info(f"Subscribers updated. Total: {len(all_subscribers)} (added: {len(new_chats)}, removed: {len(removed_chats)})")
         save_subscribers(all_subscribers)
-    return all_subscribers
+    
+    return all_subscribers, state
+
+
+def initial_subscriber_fetch(known_subscribers: set, state: dict) -> tuple[set, dict]:
+    """
+    On startup, fetch ALL recent updates (without offset) to catch any
+    StartedBot events that happened while the bot was offline.
+    """
+    logger.info("Performing initial subscriber fetch...")
+    
+    # First fetch without offset to get historical data
+    data = _rubika_post("getUpdates", {"limit": 200})
+    new_chats = set()
+    removed_chats = set()
+    next_offset_id = None
+    
+    if data:
+        updates = None
+        if isinstance(data, dict):
+            updates = data.get("updates") or (data.get("data", {}).get("updates"))
+            next_offset_id = data.get("next_offset_id") or (data.get("data", {}).get("next_offset_id"))
+        
+        if updates:
+            for update in updates:
+                update_type = update.get("type")
+                chat_id = update.get("chat_id")
+                
+                if not chat_id:
+                    chat_id = (update.get("new_message", {}).get("chat_id") or 
+                              update.get("updated_message", {}).get("chat_id"))
+                
+                if not chat_id:
+                    continue
+                
+                if update_type == "StartedBot":
+                    new_chats.add(chat_id)
+                elif update_type == "StoppedBot":
+                    removed_chats.add(chat_id)
+                elif update_type == "NewMessage":
+                    if chat_id not in known_subscribers and chat_id not in new_chats:
+                        new_chats.add(chat_id)
+    
+    # Ensure admin
+    if ADMIN_CHAT_ID:
+        new_chats.add(ADMIN_CHAT_ID)
+    
+    all_subscribers = known_subscribers | new_chats
+    all_subscribers = all_subscribers - removed_chats
+    
+    if next_offset_id:
+        state["updates_offset_id"] = next_offset_id
+    
+    if all_subscribers != known_subscribers:
+        logger.info(f"Initial fetch: {len(all_subscribers)} subscribers (added: {len(new_chats)})")
+        save_subscribers(all_subscribers)
+    
+    return all_subscribers, state
 
 
 # ---------- Delayed reaction edits ----------
@@ -317,6 +423,11 @@ async def forward_message(client, message, channel_name, state, subscribers: set
         if message.id <= last_id:
             return
 
+    # If no subscribers, skip
+    if not subscribers:
+        logger.warning("No subscribers to forward to!")
+        return
+
     # ---------- TEXT ----------
     if message.text and not message.media:
         header = _build_header(channel_name, msg_date)
@@ -325,7 +436,7 @@ async def forward_message(client, message, channel_name, state, subscribers: set
         key = (channel_name, message.id)
         pending_edits[key] = []
         all_ok = True
-        for chat_id in subscribers:
+        for chat_id in list(subscribers):  # Iterate over copy to avoid modification issues
             ok, rubika_id = send_text_to_rubika(chat_id, full_text)
             if ok and rubika_id:
                 pending_edits[key].append({
@@ -337,7 +448,7 @@ async def forward_message(client, message, channel_name, state, subscribers: set
                 all_ok = False
         if all_ok:
             state[channel_name] = message.id
-            save_state(state)   # save to local copy
+            save_state(state)
             asyncio.ensure_future(delayed_reaction_updates(client, channel_name, message.id))
         return
 
@@ -411,7 +522,7 @@ async def forward_message(client, message, channel_name, state, subscribers: set
 
 # ---------- Startup ----------
 async def catch_up(client, channels, state, subscribers):
-    if not state:
+    if not state or not any(state.get(ch) for ch in channels):
         logger.info("First run – initialising state without forwarding old messages")
         for channel in channels:
             try:
@@ -459,21 +570,22 @@ async def main():
     channels = load_channels()
     logger.info(f"Monitoring channels: {channels}")
 
-    # Load subscribers from cloned repo
+    # Load state and subscribers from cloned repo
+    state = load_state()
     subscribers = load_subscribers()
-    # Refresh subscribers from getUpdates
-    subscribers = fetch_new_subscribers(subscribers)
-    logger.info(f"Total subscribers: {len(subscribers)}")
+    
+    # Initial fetch of all subscribers (including historical StartedBot events)
+    subscribers, state = initial_subscriber_fetch(subscribers, state)
+    logger.info(f"Total subscribers after initial fetch: {len(subscribers)}")
 
     if not subscribers:
-        logger.error("No subscribers yet! At least one user must /start the bot.")
-        # still continue, the list may grow later
+        logger.warning("No subscribers yet! At least one user must /start the bot.")
+        # Still continue - the periodic refresh will pick up new users
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     await client.start()
     logger.info("Telegram client ready")
 
-    state = load_state()
     await catch_up(client, channels, state, subscribers)
 
     # Live handler
@@ -487,15 +599,20 @@ async def main():
         except Exception as e:
             logger.error(f"Handler error: {e}")
 
-    # Background task: refresh subscriber list every 5 minutes & autosave state
+    # Background task: refresh subscriber list every 5 minutes
     async def refresh_subscribers_periodic():
         while True:
-            await asyncio.sleep(300)
-            nonlocal_subscribers = subscribers
-            new_set = fetch_new_subscribers(subscribers)
+            await asyncio.sleep(300)  # 5 minutes
+            nonlocal_state = state
+            new_subscribers, updated_state = fetch_new_subscribers(subscribers, state)
+            # Update the subscribers set in-place
             subscribers.clear()
-            subscribers.update(new_set)
+            subscribers.update(new_subscribers)
+            # Update the state dict
+            state.update(updated_state)
             save_subscribers(subscribers)
+            save_state(state)
+            logger.info(f"Periodic refresh: {len(subscribers)} subscribers")
 
     asyncio.ensure_future(refresh_subscribers_periodic())
 
