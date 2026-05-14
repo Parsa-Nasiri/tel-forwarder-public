@@ -891,45 +891,44 @@ async def catchup(
     subscribers,
 ):
     if not state:
-        logger.info(
-            "First run. Setting markers."
-        )
-
+        logger.info("First run. Setting markers.")
         for channel in channels:
             try:
-                msgs = await client.get_messages(
-                    channel,
-                    limit=1,
+                # Resolve the channel entity first (timeout 5s)
+                entity = await asyncio.wait_for(
+                    client.get_entity(channel),
+                    timeout=5.0
                 )
-
-                state[channel] = (
-                    msgs[0].id
-                    if msgs
-                    else 0
+                # Now get the latest message (timeout 5s)
+                msgs = await asyncio.wait_for(
+                    client.get_messages(entity, limit=1),
+                    timeout=5.0
                 )
-
+                state[channel] = msgs[0].id if msgs else 0
+                logger.info(f"Marker set for {channel}: {state[channel]}")
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout accessing {channel} – skipping")
+                state[channel] = 0
             except Exception as e:
-                logger.error(
-                    f"Marker error {channel}: {e}"
-                )
-
+                logger.error(f"Error with {channel}: {e}")
+                state[channel] = 0
         save_state(state)
         return
 
+    # Normal catch‑up (after first run)
     for channel in channels:
         try:
-            msgs = await client.get_messages(
-                channel,
-                limit=10,
+            entity = await asyncio.wait_for(
+                client.get_entity(channel),
+                timeout=5.0
             )
-
+            msgs = await asyncio.wait_for(
+                client.get_messages(entity, limit=10),
+                timeout=5.0
+            )
             for msg in reversed(msgs):
-                if msg.id <= state.get(
-                    channel,
-                    0,
-                ):
+                if msg.id <= state.get(channel, 0):
                     continue
-
                 await forward_message(
                     client,
                     msg,
@@ -937,11 +936,10 @@ async def catchup(
                     state,
                     subscribers,
                 )
-
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout catching up on {channel} – skipping")
         except Exception as e:
-            logger.error(
-                f"Catchup error: {e}"
-            )
+            logger.error(f"Catchup error on {channel}: {e}")
 
 
 # ─────────────────────────────────────────────
