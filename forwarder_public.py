@@ -205,6 +205,7 @@ def get_top_reactions(message):
         for emoji, count in top
     )
 
+
 # ─────────────────────────────────────────────
 # FILES
 # ─────────────────────────────────────────────
@@ -250,6 +251,7 @@ def save_subscribers(subscribers):
             ensure_ascii=False,
             indent=2,
         )
+
 
 # ─────────────────────────────────────────────
 # RUBIKA API
@@ -377,8 +379,9 @@ def upload_file(file_bytes, filename, file_type):
 
     return None
 
+
 # ─────────────────────────────────────────────
-# GET UPDATES
+# GET UPDATES & SUBSCRIBER MANAGEMENT
 # ─────────────────────────────────────────────
 def extract_new_subscribers(updates, subscribers):
     new_users = set()
@@ -419,6 +422,26 @@ def extract_new_subscribers(updates, subscribers):
     return new_users
 
 
+# MODIFICATION: new helper to persist new subscribers and push to remote repo
+def _add_new_subscribers_and_push(new_users, subscribers):
+    if not new_users:
+        return
+
+    for chat_id in sorted(new_users):
+        logger.info(f"New subscriber: {chat_id}")
+
+        # Send welcome message
+        ok, _ = send_text(chat_id, build_welcome())
+        if ok:
+            subscribers.add(chat_id)
+
+    # Save to local file inside the repo
+    save_subscribers(subscribers)
+
+    # MODIFICATION: push the repo immediately so remote is up to date
+    push_repo()
+
+
 def fetch_updates(subscribers, state):
     payload = {
         "limit": 200,
@@ -440,45 +463,24 @@ def fetch_updates(subscribers, state):
         return subscribers, state
 
     updates = data.get("data", {}).get("updates", [])
+    next_offset = data.get("data", {}).get("next_offset_id")
 
-    next_offset = data.get("data", {}).get(
-        "next_offset_id"
-    )
+    logger.debug(f"Rubika updates: {len(updates)}")
 
-    # TEMP DEBUG
-    logger.info(
-        f"Rubika updates: {len(updates)}"
-    )
-
-    new_users = extract_new_subscribers(
-        updates,
-        subscribers,
-    )
+    new_users = extract_new_subscribers(updates, subscribers)
 
     if ADMIN_CHAT_ID:
         subscribers.add(ADMIN_CHAT_ID)
 
-    if new_users:
-        for chat_id in sorted(new_users):
-            logger.info(
-                f"New subscriber: {chat_id}"
-            )
-
-            ok, _ = send_text(
-                chat_id,
-                build_welcome(),
-            )
-
-            if ok:
-                subscribers.add(chat_id)
-
-        save_subscribers(subscribers)
+    # MODIFICATION: use helper to add and push immediately
+    _add_new_subscribers_and_push(new_users, subscribers)
 
     if next_offset:
         state["rubika_offset"] = next_offset
         save_state(state)
 
     return subscribers, state
+
 
 # ─────────────────────────────────────────────
 # MEDIA
@@ -497,6 +499,7 @@ def get_file_type(media):
         return "Music"
 
     return "File"
+
 
 # ─────────────────────────────────────────────
 # BROADCAST
@@ -535,6 +538,7 @@ def broadcast_file(subscribers, file_id, caption):
             })
 
     return results
+
 
 # ─────────────────────────────────────────────
 # REACTIONS
@@ -601,6 +605,7 @@ async def delayed_reaction_updates(
             )
 
     pending_edits.pop(key, None)
+
 
 # ─────────────────────────────────────────────
 # FORWARD
@@ -754,6 +759,7 @@ async def forward_message(
             )
         )
 
+
 # ─────────────────────────────────────────────
 # GIT
 # ─────────────────────────────────────────────
@@ -874,6 +880,7 @@ def push_repo():
             f"Push error: {e}"
         )
 
+
 # ─────────────────────────────────────────────
 # CATCHUP
 # ─────────────────────────────────────────────
@@ -935,6 +942,7 @@ async def catchup(
             logger.error(
                 f"Catchup error: {e}"
             )
+
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -1014,6 +1022,9 @@ async def main():
                     state,
                 )
 
+                # MODIFICATION: added periodic log to confirm polling is alive
+                logger.debug("Subscriber poll completed")
+
             except Exception as e:
                 logger.error(
                     f"Poll error: {e}"
@@ -1044,6 +1055,7 @@ async def main():
         subscribers
     )
 
+    # MODIFICATION: final push to ensure any last‑minute changes are uploaded
     push_repo()
 
     await client.disconnect()
