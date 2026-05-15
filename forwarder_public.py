@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import git
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ===================== CONFIG FROM ENVIRONMENT =====================
+# ===================== CONFIG =====================
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
@@ -39,33 +38,38 @@ logger = logging.getLogger(__name__)
 # ===================== RUBIKA API HELPER =====================
 RUBIKA_BASE = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}"
 
-async def rubika_request(method: str, payload: dict, retries: int = 3):
+async def rubika_request(method: str, payload: dict = None, retries: int = 3):
+    if payload is None:
+        payload = {}
     url = f"{RUBIKA_BASE}/{method}"
+
     for attempt in range(retries):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=35) as resp:
-                    if resp.status in (429, 502, 503, 504):
-                        await asyncio.sleep(2 ** attempt * 2)
-                        continue
-                    
-                    data = await resp.json()
+                async with session.post(url, json=payload, timeout=40) as resp:
+                    try:
+                        data = await resp.json()
+                    except:
+                        data = {"ok": False, "description": await resp.text()}
+
                     if not data.get("ok"):
-                        logger.warning(f"Rubika API {method} failed: {data.get('description')}")
+                        logger.warning(f"Rubika {method} failed: {data.get('description')}")
                     return data
         except Exception as e:
             if attempt == retries - 1:
-                logger.error(f"Rubika request failed after {retries} attempts: {e}")
+                logger.error(f"Rubika {method} failed after {retries} attempts: {e}")
                 return {"ok": False, "description": str(e)}
-            await asyncio.sleep(2 ** attempt)
-    return {"ok": False}
+            await asyncio.sleep(2 ** attempt * 1.5)
+    return {"ok": False, "description": "Max retries exceeded"}
 
-# ===================== FORMATTING =====================
+
+# ===================== MESSAGE FORMATTING =====================
 def is_proxy_line(line: str) -> bool:
     stripped = line.strip().lower()
     schemes = ("vmess://", "vless://", "ss://", "trojan://", "socks5://", "http://", "https://")
     ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$')
     return any(stripped.startswith(s) for s in schemes) or bool(ip_pattern.match(stripped))
+
 
 def format_message_for_rubika(text: str, channel_name: str):
     lines = text.splitlines()
@@ -85,7 +89,7 @@ def format_message_for_rubika(text: str, channel_name: str):
 
     for line in lines:
         stripped = line.strip()
-        if not stripped:
+        if not stripped and not formatted_parts[-1].endswith("\n\n"):
             formatted_parts.append("\n")
             current_index += 1
             continue
@@ -104,8 +108,8 @@ def format_message_for_rubika(text: str, channel_name: str):
 
     full_text = "".join(formatted_parts).strip()
     metadata = {"meta_data_parts": meta_data_parts} if meta_data_parts else None
-
     return full_text, metadata
+
 
 # ===================== GIT OPERATIONS =====================
 def setup_data_repository():
@@ -118,6 +122,7 @@ def setup_data_repository():
         git.Repo.clone_from(auth_url, DATA_DIR)
         logger.info("✅ Data repository cloned")
 
+
 def save_and_push_subscribers(subscribers: list):
     SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
@@ -128,9 +133,10 @@ def save_and_push_subscribers(subscribers: list):
         repo.index.add([SUBSCRIBERS_FILE.name])
         repo.index.commit(f"Update subscribers - {len(subscribers)} users")
         repo.remote().push()
-        logger.info(f"✅ Subscribers saved and pushed ({len(subscribers)} total)")
+        logger.info(f"✅ Subscribers pushed ({len(subscribers)} total)")
     except Exception as e:
         logger.error(f"Git push failed: {e}")
+
 
 # ===================== MAIN =====================
 async def main():
@@ -142,8 +148,8 @@ async def main():
             subscribers = json.load(f)
     else:
         subscribers = []
-    
-    sub_set = set(subscribers)
+
+    sub_set = set(str(s) for s in subscribers)  # ensure string
     logger.info(f"Loaded {len(sub_set)} subscribers")
 
     # Load channels
@@ -152,7 +158,13 @@ async def main():
     logger.info(f"Monitoring {len(channels)} Telegram channels")
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    pending_reaction_edits = {}
+
+    # Test Rubika Bot
+    test = await rubika_request("getMe")
+    if test.get("ok"):
+        logger.info("✅ Rubika Bot connected successfully")
+    else:
+        logger.error("❌ Rubika Bot token seems invalid!")
 
     @client.on(events.NewMessage(chats=channels))
     async def new_message_handler(event):
@@ -160,42 +172,42 @@ async def main():
             return
 
         chat = await event.get_chat()
-        channel_name = getattr(chat, 'title', None) or getattr(chat, 'username', 'Channel')
+        channel_name = getattr(chat, 'title', None) or getattr(chat, 'username', 'Unknown Channel')
 
         raw_text = event.message.message or ""
         formatted_text, metadata = format_message_for_rubika(raw_text, channel_name)
 
         for chat_id in list(sub_set):
             try:
-                resp = await rubika_request("sendMessage", {
+                await rubika_request("sendMessage", {
                     "chat_id": chat_id,
                     "text": formatted_text,
                     "metadata": metadata
                 })
-                # TODO: Store message for reaction updates if needed
             except Exception as e:
-                logger.error(f"Failed to send to {chat_id}: {e}")
+                logger.error(f"Failed to forward to {chat_id}: {e}")
 
-    # Subscriber Polling Task
+    # Subscriber Polling
     async def poll_new_subscribers():
         nonlocal sub_set
-        offset = 0
+        offset_id = None
+
         while True:
             try:
-                data = await rubika_request("getUpdates", {"offset": offset})
-                if data.get("ok") and data.get("result"):
-                    for update in data["result"]:
-                        update_id = update.get("update_id")
-                        if update_id:
-                            offset = max(offset, update_id + 1)
+                payload = {"offset_id": offset_id} if offset_id else {}
+                data = await rubika_request("getUpdates", payload)
 
-                        # Detect new users
-                        if "new_message" in update.get("update", {}):
+                if data.get("ok") and isinstance(data.get("result"), list):
+                    for update in data["result"]:
+                        if "update_id" in update:
+                            offset_id = update.get("update_id")
+
+                        if "update" in update and "new_message" in update["update"]:
                             msg = update["update"]["new_message"]
                             chat_id = str(msg.get("chat_id"))
-                            text = msg.get("text", "").strip()
+                            text = str(msg.get("text", "")).strip().lower()
 
-                            if text == "/start" or msg.get("action") == "StartedBot":
+                            if text == "/start" or update["update"].get("action") == "StartedBot":
                                 if chat_id not in sub_set:
                                     sub_set.add(chat_id)
                                     save_and_push_subscribers(list(sub_set))
@@ -203,42 +215,32 @@ async def main():
                                     welcome = (
                                         "**✅ خوش آمدید!**\n\n"
                                         "این ربات پیام‌های کانال‌های پروکسی و VPN را به‌صورت خودکار برای شما فوروارد می‌کند.\n\n"
-                                        "لینک‌ها به صورت **مونوسپیس + blockquote** نمایش داده می‌شوند تا به‌راحتی کپی کنید."
+                                        "لینک‌ها به صورت آماده برای کپی نمایش داده می‌شوند."
                                     )
                                     await rubika_request("sendMessage", {"chat_id": chat_id, "text": welcome})
-
-                                    logger.info(f"New subscriber added: {chat_id}")
+                                    logger.info(f"✅ New subscriber added: {chat_id}")
             except Exception as e:
-                logger.error(f"Subscriber polling error: {e}")
+                logger.error(f"Polling error: {e}")
 
-            await asyncio.sleep(50)
+            await asyncio.sleep(45)
 
     async with client:
         logger.info("🚀 Telegram client started successfully")
-        
-        # Catch-up last messages
-        for ch in channels[:]:
-            try:
-                async for msg in client.iter_messages(ch, limit=8):
-                    if (datetime.now(timezone.utc) - msg.date).total_seconds() < 7200:  # last 2 hours
-                        # You can call handler logic here if needed
-                        pass
-            except:
-                continue
 
+        # Start tasks
         tasks = [
             asyncio.create_task(poll_new_subscribers()),
-            # Add reaction updater task later if needed
         ]
 
         try:
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=RUN_DURATION)
         except asyncio.TimeoutError:
-            logger.info("⏰ Runtime duration reached. Shutting down gracefully...")
+            logger.info("⏰ Runtime limit reached. Shutting down...")
         finally:
             save_and_push_subscribers(list(sub_set))
             await client.disconnect()
-            logger.info("👋 Bot stopped.")
+            logger.info("👋 Bot stopped gracefully.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
