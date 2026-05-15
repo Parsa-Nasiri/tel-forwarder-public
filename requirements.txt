@@ -1,3 +1,4 @@
 telethon>=1.28
 requests>=2.28
 aiohttp
+git
