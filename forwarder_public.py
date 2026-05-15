@@ -537,38 +537,35 @@ def handle_new_subscribers(new_chat_ids: list[str], subscribers: set) -> bool:
     return True
 
 
+# ─────────────────────────────────────────────
+# FETCH & PROCESS SUBSCRIBERS - WITH DEBUG LOGGING
+# ─────────────────────────────────────────────
 def fetch_and_process_subscribers(subscribers: set, state: dict) -> tuple[set, dict]:
     """
-    MAIN ENTRY POINT for subscriber management:
-    1. Call Rubika getUpdates API
-    2. Process response with simple algorithm
-    3. Handle any new subscribers found
-    4. Update state with next_offset_id
+    Fetch updates from Rubika and process new subscribers.
+    Now includes detailed debugging for API issues.
     """
     logger.info("🔄 Fetching updates from Rubika getUpdates...")
     
-    # Build request payload - simple, no complex offset logic for subscriber detection
+    # Build request payload - SIMPLE, no offset for subscriber detection
     payload = {
-        "limit": 200,      # Get up to 200 latest updates
-        "state": "all",    # Get all types of updates
-        # NOTE: We intentionally do NOT use offset_id here for subscriber detection
-        # because StartedBot events may have old timestamps. We rely on set comparison instead.
+        "limit": 200,
+        "state": "all",
     }
     
-    # Make API call
-    api_response = rubika_post("getUpdates", payload, timeout=40)
+    # Make API call with retry logic
+    api_response = rubika_post("getUpdates", payload, timeout=40, max_retries=3)
     
-    # Handle API errors
+    # Handle API errors with detailed logging
     if not api_response:
-        logger.error("❌ getUpdates API call failed or returned invalid response")
+        logger.error("❌ getUpdates API call failed completely - check token, network, or API status")
+        # Return unchanged - don't crash the bot
         return subscribers, state
     
-    if api_response.get("status") != "OK":
-        error_msg = api_response.get("data", {}).get("error", "Unknown API error")
-        logger.error(f"❌ getUpdates returned error status: {error_msg}")
-        return subscribers, state
-    
-    logger.info("✅ Received valid response from getUpdates")
+    # Log the full response structure for debugging
+    logger.debug(f"🔍 Full API response keys: {list(api_response.keys())}")
+    if "data" in api_response:
+        logger.debug(f"🔍 Data keys: {list(api_response.get('data', {}).keys())}")
     
     # Process updates with our simple algorithm
     updated_subscribers, new_chat_ids, next_offset = process_rubika_updates_for_subscribers(
@@ -578,11 +575,12 @@ def fetch_and_process_subscribers(subscribers: set, state: dict) -> tuple[set, d
     
     # Handle any new subscribers found
     if new_chat_ids:
+        logger.info(f"🎯 Found {len(new_chat_ids)} new subscriber(s) to process")
         handle_new_subscribers(new_chat_ids, updated_subscribers)
     else:
         logger.debug("ℹ️ No new subscribers in this batch")
     
-    # Update state with next_offset for general update tracking (not subscriber detection)
+    # Update state with next_offset for general tracking
     if next_offset:
         state["rubika_offset"] = next_offset
         save_state(state)
