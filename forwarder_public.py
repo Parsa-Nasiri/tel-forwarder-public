@@ -214,15 +214,22 @@ async def rubika_post(method: str, payload: dict, session: aiohttp.ClientSession
                     await asyncio.sleep(wait)
                     continue
                 data = await r.json(content_type=None)
-                if data.get("status") == "auth_error":
+                status = (data.get("status") or "").upper()
+                if status == "AUTH_ERROR":
                     log.critical("Rubika auth error: %s", data)
                     return None
-                if data.get("status") not in ("ok", None):
-                    err = data.get("status_det", "")
+                if status == "TOO_REQUESTS":
+                    wait = 2 ** attempt
+                    log.warning("%s rate-limited — retry in %ss", method, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                if status not in ("OK", ""):
+                    err = data.get("status_det", "") or data.get("dev_message", "")
                     if "transient" in str(err).lower():
                         await asyncio.sleep(2 ** attempt)
                         continue
                     log.warning("%s API error: %s", method, data)
+                    return data   # still return so callers can inspect
                 return data
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
             log.warning("%s connection error (attempt %d): %s", method, attempt, e)
@@ -262,18 +269,39 @@ async def rubika_upload_file(file_bytes: bytes, file_type: str,
         log.error("No upload_url in response")
         return None
 
-    # Step 2: POST file bytes
+    # Step 2: POST raw file bytes (Rubika upload endpoint expects raw body, not multipart)
     try:
-        form = aiohttp.FormData()
-        form.add_field("file", file_bytes, filename="upload",
-                       content_type="application/octet-stream")
-        async with session.post(upload_url, data=form,
-                                 timeout=aiohttp.ClientTimeout(total=120)) as r:
-            data = await r.json(content_type=None)
-            file_id = data.get("file_id") or (data.get("data") or {}).get("file_id")
-            if file_id:
+        async with session.post(
+            upload_url,
+            data=file_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as r:
+            raw = await r.read()
+            # Rubika may return empty body on success OR JSON with file_id
+            if not raw or raw.strip() in (b"", b"null"):
+                # Empty / null body = upload accepted; file_id comes from URL path
+                # Extract token from upload_url as file_id (last path segment)
+                file_id = upload_url.rstrip("/").split("/")[-1]
+                log.info("Upload succeeded (empty body); using URL token as file_id")
                 return file_id
-            log.error("Upload response missing file_id: %s", data)
+            import json as _json
+            try:
+                data = _json.loads(raw)
+                file_id = (
+                    data.get("file_id")
+                    or (data.get("data") or {}).get("file_id")
+                )
+                if file_id:
+                    return file_id
+                log.error("Upload response missing file_id: %s", data)
+            except _json.JSONDecodeError:
+                # Non-JSON body — treat the raw text as file_id if it looks like one
+                token = raw.decode(errors="replace").strip()
+                if token and len(token) < 200:
+                    log.info("Upload: using raw response as file_id: %s", token)
+                    return token
+                log.error("Unreadable upload response: %r", raw[:200])
     except Exception as e:
         log.error("File upload error: %s", e)
     return None
@@ -288,13 +316,41 @@ async def rubika_send_file(chat_id: str, file_id: str, caption: str,
     return None
 
 
+MAX_CHARS = 4800   # stay safely under 5000
+MAX_LINES = 120    # stay safely under 128
+
+
+def _split_message(text: str) -> list[str]:
+    """Split a long message into chunks that fit Rubika limits."""
+    lines = text.splitlines(keepends=True)
+    chunks, current, clines = [], [], 0
+    for line in lines:
+        if (clines + 1 > MAX_LINES) or (sum(len(l) for l in current) + len(line) > MAX_CHARS):
+            if current:
+                chunks.append("".join(current))
+            current, clines = [line], 1
+        else:
+            current.append(line)
+            clines += 1
+    if current:
+        chunks.append("".join(current))
+    return chunks or [text]
+
+
 async def broadcast_text(text: str, session: aiohttp.ClientSession) -> list:
-    """Send text to all subscribers. Returns list of (chat_id, message_id)."""
+    """Send text to all subscribers, splitting if needed. Returns list of (chat_id, message_id)."""
+    chunks = _split_message(text)
     results = []
     for chat_id in list(subscribers):
-        mid = await rubika_send_message(chat_id, text, session)
-        if mid:
-            results.append((chat_id, mid))
+        last_mid = None
+        for i, chunk in enumerate(chunks):
+            suffix = f"  _({i+1}/{len(chunks)})_" if len(chunks) > 1 else ""
+            mid = await rubika_send_message(chat_id, chunk + suffix, session)
+            if mid:
+                last_mid = mid
+            await asyncio.sleep(0.1)
+        if last_mid:
+            results.append((chat_id, last_mid))
         await asyncio.sleep(0.05)
     return results
 
