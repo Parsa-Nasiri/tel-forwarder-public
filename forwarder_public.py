@@ -12,8 +12,6 @@ import logging
 import time
 import re
 import subprocess
-import tempfile
-import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,38 +91,45 @@ update_offset: str  = None    # Rubika getUpdates offset
 # GIT / DATA REPO
 # ══════════════════════════════════════════════════════════════
 
-def _git_credential_helper() -> str:
-    """Write a temp credential-helper script and return its path."""
+def _authenticated_url(url: str) -> str:
+    """
+    Inject PAT into a GitHub HTTPS URL so git never needs to prompt.
+    https://github.com/owner/repo  →  https://x-token:PAT@github.com/owner/repo
+    Works in GitHub Actions, Docker, any environment.
+    """
     pat = DATA_REPO_PAT
-    script = f"""#!/bin/sh
-echo username=x-token
-echo password={pat}
-"""
-    tf = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False)
-    tf.write(script)
-    tf.flush()
-    os.chmod(tf.name, stat.S_IRWXU)
-    return tf.name
+    # Handle both https:// and git+https:// forms
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        # Strip any existing credentials (safety)
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+        return f"{scheme}://x-token:{pat}@{rest}"
+    return url
 
 
 def git_clone():
-    cred = _git_credential_helper()
-    url  = DATA_REPO_URL
-    env  = os.environ.copy()
-    env["GIT_ASKPASS"] = cred
+    auth_url = _authenticated_url(DATA_REPO_URL)
     log.info("Cloning data repo …")
-    subprocess.run(
-        ["git", "clone", url, str(DATA_REPO_DIR)],
-        env=env, check=True, capture_output=True,
+    result = subprocess.run(
+        ["git", "clone", auth_url, str(DATA_REPO_DIR)],
+        capture_output=True,
     )
+    if result.returncode != 0:
+        # Redact PAT from error output before logging
+        err = result.stderr.decode(errors="replace").replace(DATA_REPO_PAT, "***")
+        raise RuntimeError(f"git clone failed (exit {result.returncode}): {err}")
     log.info("Data repo cloned ✓")
 
 
 def git_push(message: str = "update"):
-    cred = _git_credential_helper()
-    env  = os.environ.copy()
-    env["GIT_ASKPASS"] = cred
+    auth_url = _authenticated_url(DATA_REPO_URL)
     try:
+        # Embed PAT into remote URL so push authenticates without prompting
+        subprocess.run(
+            ["git", "-C", str(DATA_REPO_DIR), "remote", "set-url", "origin", auth_url],
+            check=True, capture_output=True,
+        )
         subprocess.run(
             ["git", "-C", str(DATA_REPO_DIR), "config", "user.email", "bot@rubika"],
             check=True, capture_output=True,
@@ -144,13 +149,18 @@ def git_push(message: str = "update"):
         if result.returncode not in (0, 1):
             log.warning("git commit returned %s", result.returncode)
             return
-        subprocess.run(
+        push_result = subprocess.run(
             ["git", "-C", str(DATA_REPO_DIR), "push"],
-            env=env, check=True, capture_output=True,
+            capture_output=True,
         )
-        log.info("git push ✓ — %s", message)
+        if push_result.returncode != 0:
+            err = push_result.stderr.decode(errors="replace").replace(DATA_REPO_PAT, "***")
+            log.error("git push failed: %s", err)
+        else:
+            log.info("git push ✓ — %s", message)
     except subprocess.CalledProcessError as e:
-        log.error("git error: %s", e.stderr.decode(errors="replace"))
+        err = e.stderr.decode(errors="replace").replace(DATA_REPO_PAT, "***")
+        log.error("git error: %s", err)
 
 
 # ══════════════════════════════════════════════════════════════
