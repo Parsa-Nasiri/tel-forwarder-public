@@ -8,7 +8,6 @@ import sys
 import time
 from datetime import timezone
 from pathlib import Path
-
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -19,31 +18,26 @@ from telethon.sessions import StringSession
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["STRING_SESSION"]
-
 RUBIKA_BOT_TOKEN = os.environ["RUBIKA_BOT_TOKEN"]
-
 DATA_REPO_PAT = os.environ["DATA_REPO_PAT"]
 DATA_REPO_URL = os.environ["DATA_REPO_URL"]
-
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 RUN_DURATION = 20400
-SUBSCRIBER_REFRESH_INTERVAL = 60  # every 1 minute
-
+SUBSCRIBER_REFRESH_INTERVAL = 60  # Poll Rubika getUpdates every 1 minute
 REACTION_EDIT_SCHEDULE = [
-    (180, "3m"),
-    (300, "5m"),
-    (600, "10m"),
-    (900, "15m"),
-    (1500, "25m"),
-    (1800, "30m"),
-    (3600, "1H"),
-    (7200, "2H"),
+    (180,  "3m "),
+    (300,  "5m "),
+    (600,  "10m "),
+    (900,  "15m "),
+    (1500, "25m "),
+    (1800, "30m "),
+    (3600, "1H "),
+    (7200, "2H "),
 ]
-
 MAX_FILE_SIZE_MB = {
     "Image": 10,
     "Video": 50,
@@ -52,7 +46,6 @@ MAX_FILE_SIZE_MB = {
     "Voice": 10,
     "Gif": 50,
 }
-
 VPN_PREFIXES = (
     "vmess://",
     "vless://",
@@ -70,7 +63,6 @@ VPN_PREFIXES = (
 # PATHS
 # ─────────────────────────────────────────────
 DATA_REPO_DIR = Path("data_repo")
-
 STATE_FILE = DATA_REPO_DIR / "state.json"
 SUBSCRIBERS_FILE = DATA_REPO_DIR / "subscribers.json"
 CHANNELS_FILE = Path("channels.json")
@@ -83,444 +75,404 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stdout,
 )
-
 logger = logging.getLogger("forwarder")
 
 # ─────────────────────────────────────────────
-# PROXY / CONFIG TEXT FORMATTING
-#
-# Strategy: We use Rubika's Metadata API to apply
-#   - Quote  → wraps each config block visually
-#   - Pre    → monospace code block for configs
-#
-# Plain text is sent as-is. Config lines (VPN prefixes)
-# are grouped into blocks and annotated via metadata.
+# MARKDOWN & FORMATTING (Quote + Mono for Rubika)
 # ─────────────────────────────────────────────
-def is_proxy_line(line: str) -> bool:
-    stripped = line.strip().lower()
-    return any(stripped.startswith(p) for p in VPN_PREFIXES)
+def md_bold(text):
+    return f"*{text}*"
 
+def md_italic(text):
+    return f"_{text}_"
 
-def build_proxy_payload(text: str):
+def md_mono(text):
+    # Using backticks for monospace (Markdown compatible with Rubika parse_mode="Markdown")
+    return f"`{text}`"
+
+def md_quote(text):
+    # Using > prefix for quote blocks (Markdown compatible)
+    lines = text.split('\n')
+    return '\n'.join(f"> {line}" for line in lines)
+
+def md_code(text):
+    # For multi-line code blocks, use triple backticks
+    return f"```\n{text}\n```"
+
+def is_proxy_line(line):
+    """Check if a line is a VPN/proxy config line"""
+    line = line.strip().lower()
+    return any(line.startswith(prefix) for prefix in VPN_PREFIXES)
+
+def format_proxy_text(text):
     """
-    Parse the message text and return:
-      (final_text, metadata_parts)
-
-    Config lines are grouped into contiguous blocks.
-    Each block gets:
-      - MetadataTypeEnum: Pre  (mono / code block)
-      - MetadataTypeEnum: Quote (quoted block)
-
-    Non-config lines are kept as plain text.
-
-    Returns a tuple:
-      - final_text: str   — the assembled plain text
-      - meta_parts: list  — list of MetadataPart dicts for the Rubika API
+    Format proxy configs with Quote + Mono formatting.
+    Handles bulk IPs sent consecutively or with line breaks.
     """
     if not text:
-        return "", []
-
+        return ""
+    
     lines = text.splitlines()
+    result = []
+    proxy_buffer = []
 
-    # ── pass 1: classify each line ──
-    classified = []  # list of (is_proxy: bool, line: str)
+    def flush_proxy_buffer():
+        nonlocal proxy_buffer
+        if proxy_buffer:
+            # Apply Mono formatting to each proxy line, then wrap in Quote block
+            mono_lines = [md_mono(line) for line in proxy_buffer]
+            quoted_block = md_quote('\n'.join(mono_lines))
+            result.append(quoted_block)
+            proxy_buffer = []
+
     for line in lines:
-        classified.append((is_proxy_line(line), line.strip() if is_proxy_line(line) else line))
-
-    # ── pass 2: group consecutive proxy lines into blocks ──
-    # Result is a flat sequence of segments: ("text"|"proxy", content)
-    segments = []
-    i = 0
-    while i < len(classified):
-        is_proxy, content = classified[i]
-        if not is_proxy:
-            segments.append(("text", content))
-            i += 1
+        stripped = line.strip()
+        
+        if is_proxy_line(stripped):
+            # Clean the line and add to buffer
+            proxy_buffer.append(stripped)
         else:
-            # Collect consecutive proxy lines
-            block_lines = []
-            while i < len(classified) and classified[i][0]:
-                block_lines.append(classified[i][1])
-                i += 1
-            segments.append(("proxy", "\n".join(block_lines)))
+            flush_proxy_buffer()
+            if stripped:  # Only add non-empty non-proxy lines
+                result.append(line)
 
-    # ── pass 3: build final_text and metadata ──
-    # Rubika Metadata uses UTF-16 code unit offsets.
-    # Python's str uses UTF-16 internally for BMP chars.
-    # Emoji and some chars are 2 UTF-16 units; we must account for that.
-
-    parts = []
-    meta_parts = []
-
-    def utf16_len(s: str) -> int:
-        """Length of string in UTF-16 code units (surrogate pairs = 2)."""
-        return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
-
-    cursor = 0  # UTF-16 offset into the assembled text
-
-    for idx, (seg_type, content) in enumerate(segments):
-        if idx > 0:
-            # Add newline separator between segments
-            separator = "\n"
-            parts.append(separator)
-            cursor += utf16_len(separator)
-
-        if seg_type == "text":
-            parts.append(content)
-            cursor += utf16_len(content)
-        else:
-            # proxy block: apply Pre (mono) + Quote
-            seg_len = utf16_len(content)
-            # Pre = monospace code block
-            meta_parts.append({
-                "type": "Pre",
-                "from_index": cursor,
-                "length": seg_len,
-            })
-            # Quote = quoted visual block
-            meta_parts.append({
-                "type": "Quote",
-                "from_index": cursor,
-                "length": seg_len,
-            })
-            parts.append(content)
-            cursor += seg_len
-
-    final_text = "".join(parts)
-    return final_text, meta_parts
-
+    flush_proxy_buffer()
+    return '\n'.join(result)
 
 # ─────────────────────────────────────────────
 # UX
 # ─────────────────────────────────────────────
-def build_header(channel_name: str, msg_date) -> str:
+def build_header(channel_name, msg_date):
     date_str = msg_date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📡 {channel_name}\n"
-        f"🕐 {date_str}\n"
+        f"📡 {md_bold(channel_name)}\n"
+        f"🕐 {md_italic(date_str)}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
-
-def build_message_parts(channel_name: str, msg_date, body: str):
-    """
-    Returns (final_text, meta_parts) ready for the Rubika API.
-    The header is plain text; body config lines get Pre+Quote metadata.
-    """
+def build_message(channel_name, msg_date, body):
     header = build_header(channel_name, msg_date)
+    body = format_proxy_text(body)
+    
+    if body:
+        return f"{header}\n\n{body}"
+    return header
 
-    if not body:
-        return header, []
-
-    # Build proxy-aware body
-    body_text, body_meta = build_proxy_payload(body)
-
-    # Header offset in UTF-16
-    def utf16_len(s: str) -> int:
-        return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
-
-    header_and_sep = header + "\n\n"
-    header_offset = utf16_len(header_and_sep)
-
-    # Shift body metadata offsets by header length
-    shifted_meta = []
-    for part in body_meta:
-        shifted_meta.append({
-            **part,
-            "from_index": part["from_index"] + header_offset,
-        })
-
-    final_text = header_and_sep + body_text
-    return final_text, shifted_meta
-
-
-def build_welcome() -> str:
+def build_welcome():
+    """Welcome message for newly accepted users"""
     return (
-        "شما پذیرفته شدید\n\n"
+        f"{md_bold('شما پذیرفته شدید')}\n\n"
         "کانفیگ‌های جدید به‌صورت خودکار ارسال می‌شوند.\n\n"
         "لینک‌های پروکسی داخل بخش قابل‌کپی قرار می‌گیرند."
     )
 
-
-def build_skip_message(file_type: str, size_mb: float) -> str:
+def build_skip_message(file_type, size_mb):
     return (
-        f"⚠️ فایل بزرگ رد شد\n\n"
-        f"نوع: {file_type}\n"
-        f"حجم: {size_mb:.1f} MB"
+        f"⚠️ {md_bold('فایل بزرگ رد شد')}\n\n"
+        f"نوع: {md_mono(file_type)}\n"
+        f"حجم: {md_mono(f'{size_mb:.1f} MB')}"
     )
 
-
-def get_top_reactions(message) -> str:
-    if not message.reactions:
+def get_top_reactions(message):
+    if not message.reactions or not message.reactions.results:
         return ""
-    if not message.reactions.results:
-        return ""
-
+    
     reactions = []
     for item in message.reactions.results:
         emoji = getattr(item.reaction, "emoticon", str(item.reaction))
         reactions.append((emoji, item.count))
-
+    
     reactions.sort(key=lambda x: x[1], reverse=True)
     top = reactions[:3]
-    return "  ".join(f"{emoji} {count}" for emoji, count in top)
-
+    
+    return "  ".join(f"{emoji} {md_bold(str(count))}" for emoji, count in top)
 
 # ─────────────────────────────────────────────
 # FILES
 # ─────────────────────────────────────────────
 def load_channels():
     if not CHANNELS_FILE.exists():
-        logger.error("channels.json not found")
+        logger.error("❌ channels.json not found")
         sys.exit(1)
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+        channels = json.load(f)
+        logger.info(f"✅ Loaded {len(channels)} channels: {channels}")
+        return channels
 
 def load_state():
     if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
+            logger.debug(f"📦 Loaded state with {len(state)} entries")
+            return state
+    logger.info("📦 No state file found, starting fresh")
     return {}
-
 
 def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    logger.debug(f"💾 State saved to {STATE_FILE}")
 
-
-def load_subscribers() -> set:
+def load_subscribers():
+    """Load existing subscribers from the private repo file"""
     if SUBSCRIBERS_FILE.exists():
         with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            subs = set(json.load(f))
+            logger.info(f"👥 Loaded {len(subs)} existing subscribers from repo")
+            return subs
+    logger.info("👥 No subscribers file found, starting with empty set")
     return set()
 
-
-def save_subscribers(subscribers: set):
+def save_subscribers(subscribers):
+    """Save subscribers to the private repo file"""
     SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(subscribers), f, ensure_ascii=False, indent=2)
-
+    logger.info(f"💾 Saved {len(subscribers)} subscribers to {SUBSCRIBERS_FILE}")
 
 # ─────────────────────────────────────────────
 # RUBIKA API
 # ─────────────────────────────────────────────
-def rubika_post(method: str, payload=None, timeout=20):
+def rubika_post(method, payload=None, timeout=20):
+    """Make POST request to Rubika Bot API"""
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/{method}"
     try:
+        logger.debug(f"🔗 Calling Rubika API: {method}")
         response = requests.post(url, json=payload or {}, timeout=timeout)
+        
         if response.status_code != 200:
-            logger.error(f"{method} HTTP {response.status_code}: {response.text[:300]}")
+            logger.error(f"❌ {method} HTTP {response.status_code}: {response.text[:300]}")
             return None
-        return response.json()
+        
+        result = response.json()
+        logger.debug(f"✅ {method} response status: {result.get('status')}")
+        return result
+        
     except Exception as e:
-        logger.error(f"{method} error: {e}")
+        logger.error(f"❌ {method} request error: {e}")
         return None
 
-
-def send_text(chat_id: str, text: str, meta_parts: list = None):
-    """
-    Send a text message. If meta_parts is provided, use Metadata API
-    for rich formatting (Quote, Pre, Bold, etc).
-    """
-    payload = {
+def send_text(chat_id, text):
+    """Send text message via Rubika Bot API with Markdown parse_mode"""
+    logger.info(f"📤 Sending text to chat_id: {chat_id}")
+    data = rubika_post("sendMessage", {
         "chat_id": chat_id,
         "text": text,
-    }
-
-    if meta_parts:
-        payload["metadata"] = {"meta_data_parts": meta_parts}
-
-    data = rubika_post("sendMessage", payload)
-
+        "parse_mode": "Markdown",
+    })
+    
     if not data:
+        logger.error(f"❌ Failed to send message to {chat_id}")
         return False, None
-
+    
     if data.get("status") == "OK":
         msg_id = data.get("data", {}).get("message_id")
+        logger.info(f"✅ Message sent to {chat_id}, msg_id: {msg_id}")
         return True, msg_id
-
-    logger.warning(f"sendMessage non-OK for {chat_id}: {data}")
+    
+    logger.error(f"❌ sendMessage returned non-OK status: {data}")
     return False, None
 
-
-def edit_text(chat_id: str, message_id: str, text: str, meta_parts: list = None):
-    payload = {
+def edit_text(chat_id, message_id, text):
+    """Edit existing message text via Rubika Bot API"""
+    logger.debug(f"✏️ Editing message {message_id} in chat {chat_id}")
+    data = rubika_post("editMessageText", {
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
-    }
-    if meta_parts:
-        payload["metadata"] = {"meta_data_parts": meta_parts}
+        "parse_mode": "Markdown",
+    })
+    success = bool(data and data.get("status") == "OK")
+    logger.debug(f"{'✅' if success else '❌'} Edit result: {success}")
+    return success
 
-    data = rubika_post("editMessageText", payload)
-    return bool(data and data.get("status") == "OK")
-
-
-def send_file(chat_id: str, file_id: str, caption: str, meta_parts: list = None):
-    payload = {
+def send_file(chat_id, file_id, caption):
+    """Send file via Rubika Bot API"""
+    logger.info(f"📎 Sending file {file_id} to chat_id: {chat_id}")
+    data = rubika_post("sendFile", {
         "chat_id": chat_id,
         "file_id": file_id,
         "text": caption,
-    }
-    if meta_parts:
-        payload["metadata"] = {"meta_data_parts": meta_parts}
-
-    data = rubika_post("sendFile", payload)
-
+        "parse_mode": "Markdown",
+    })
+    
     if not data:
+        logger.error(f"❌ Failed to send file to {chat_id}")
         return False, None
-
+    
     if data.get("status") == "OK":
         msg_id = data.get("data", {}).get("message_id")
+        logger.info(f"✅ File sent to {chat_id}, msg_id: {msg_id}")
         return True, msg_id
-
+    
+    logger.error(f"❌ sendFile returned non-OK status: {data}")
     return False, None
 
-
-def upload_file(file_bytes: bytes, filename: str, file_type: str):
+def upload_file(file_bytes, filename, file_type):
+    """Upload file to Rubika and get file_id"""
+    logger.info(f"⬆️ Uploading file: {filename} (type: {file_type})")
+    
     req = rubika_post("requestSendFile", {"type": file_type})
     if not req:
+        logger.error("❌ requestSendFile failed")
         return None
-
+    
     upload_url = req.get("data", {}).get("upload_url")
     if not upload_url:
-        logger.error("upload_url missing")
+        logger.error("❌ upload_url missing from response")
         return None
-
+    
     try:
         response = requests.post(
             upload_url,
             files={"file": (filename, file_bytes)},
             timeout=120,
         )
+        
         if response.status_code != 200:
-            logger.error(f"Upload HTTP {response.status_code}")
+            logger.error(f"❌ Upload HTTP {response.status_code}")
             return None
-
+        
         data = response.json()
         file_id = data.get("data", {}).get("file_id")
+        
         if file_id:
+            logger.info(f"✅ File uploaded successfully, file_id: {file_id}")
             return file_id
+        logger.error("❌ file_id not found in upload response")
+        
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-
+        logger.error(f"❌ Upload exception: {e}")
+    
     return None
-
 
 # ─────────────────────────────────────────────
 # GET UPDATES & SUBSCRIBER MANAGEMENT
-#
-# Every 60 seconds:
-#   1. Call getUpdates with current offset_id
-#   2. Extract all chat_ids from updates
-#   3. Diff against known subscribers
-#   4. New ones → send welcome → add to set → save → push
 # ─────────────────────────────────────────────
-def extract_chat_ids_from_updates(updates: list) -> set:
-    """
-    Extract every unique chat_id from any update type.
-    We cast a wide net: StartedBot, NewMessage, /start commands.
-    """
-    found = set()
+def extract_new_subscribers(updates, existing_subscribers):
+    """Extract new chat_ids from Rubika updates"""
+    new_users = set()
+    logger.debug(f"🔍 Processing {len(updates)} updates for new subscribers")
+    
     for update in updates:
         chat_id = update.get("chat_id")
         if not chat_id:
             continue
+        
         update_type = update.get("type", "")
-
+        
+        # Case 1: User started the bot (StartedBot event)
         if update_type == "StartedBot":
-            logger.info(f"[SUBSCRIBER] StartedBot event from chat_id={chat_id}")
-            found.add(chat_id)
+            if chat_id not in existing_subscribers:
+                logger.info(f"🆕 New subscriber via StartedBot: {chat_id}")
+                new_users.add(chat_id)
             continue
-
+        
+        # Case 2: User sent /start message or clicked start button
         if update_type == "NewMessage":
             msg = update.get("new_message", {})
             text = str(msg.get("text", "")).strip().lower()
             aux_data = msg.get("aux_data", {})
             button_id = str(aux_data.get("button_id", "")).lower()
-
+            
             if text == "/start" or button_id == "start":
-                logger.info(f"[SUBSCRIBER] /start from chat_id={chat_id}")
-                found.add(chat_id)
+                if chat_id not in existing_subscribers:
+                    logger.info(f"🆕 New subscriber via /start: {chat_id}")
+                    new_users.add(chat_id)
+    
+    logger.info(f"📊 Found {len(new_users)} new subscribers in this batch")
+    return new_users
 
-    return found
-
-
-def _welcome_and_register(new_chat_ids: set, subscribers: set):
+def _add_new_subscribers_and_push(new_users, subscribers):
     """
-    For each genuinely new chat_id:
-      - Send welcome message
-      - Log result
-      - Add to subscribers set
+    Add new subscribers, send welcome message, save to repo, and push immediately.
+    Includes extensive logging as requested.
     """
-    if not new_chat_ids:
+    if not new_users:
+        logger.debug("ℹ️ No new subscribers to process")
         return
-
-    logger.info(f"[SUBSCRIBER] {len(new_chat_ids)} new subscriber(s) detected: {sorted(new_chat_ids)}")
-
-    for chat_id in sorted(new_chat_ids):
-        ok, msg_id = send_text(chat_id, build_welcome())
-        if ok:
-            logger.info(f"[SUBSCRIBER] ✅ Welcome sent to {chat_id} (msg_id={msg_id})")
-            subscribers.add(chat_id)
-        else:
-            logger.warning(f"[SUBSCRIBER] ❌ Failed to send welcome to {chat_id} — skipping add")
-
+    
+    logger.info(f"🚀 Processing {len(new_users)} new subscriber(s)")
+    
+    for chat_id in sorted(new_users):
+        try:
+            logger.info(f"👤 Adding new subscriber: {chat_id}")
+            
+            # Send welcome message: "شما پذیرفته شدید"
+            ok, msg_id = send_text(chat_id, build_welcome())
+            
+            if ok and msg_id:
+                subscribers.add(chat_id)
+                logger.info(f"✅ Welcome message sent to {chat_id} (msg_id: {msg_id})")
+            else:
+                logger.warning(f"⚠️ Failed to send welcome to {chat_id}, but still adding to list")
+                subscribers.add(chat_id)  # Add anyway to avoid repeated attempts
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing subscriber {chat_id}: {e}")
+            continue
+    
+    # Save updated subscribers list to local repo file
+    logger.info(f"💾 Saving {len(subscribers)} total subscribers to {SUBSCRIBERS_FILE}")
     save_subscribers(subscribers)
-    logger.info(f"[SUBSCRIBER] Saved. Total subscribers: {len(subscribers)}")
+    
+    # Push to remote repo immediately to sync new subscribers
+    logger.info("🔄 Pushing updated subscribers to remote repo...")
     push_repo()
+    logger.info("✅ Repo push completed")
 
-
-def fetch_updates(subscribers: set, state: dict):
+def fetch_updates(subscribers, state):
     """
-    Poll Rubika getUpdates, find new chat_ids not in subscribers,
-    welcome them, persist, and push.
+    Fetch updates from Rubika Bot API every 1 minute.
+    Compares new chat_ids with existing ones and adds new subscribers.
     """
-    logger.info("[POLL] Fetching Rubika updates…")
-
-    payload = {"limit": 200}
+    logger.info("🔄 Fetching updates from Rubika (getUpdates)...")
+    
+    payload = {"limit": 200, "state": "all"}
     offset_id = state.get("rubika_offset")
+    
     if offset_id:
         payload["offset_id"] = offset_id
-
+        logger.debug(f"📍 Using offset_id: {offset_id}")
+    
     data = rubika_post("getUpdates", payload, timeout=40)
+    
     if not data:
-        logger.warning("[POLL] getUpdates returned no data")
+        logger.warning("⚠️ getUpdates returned no data")
         return subscribers, state
-
+    
     updates = data.get("data", {}).get("updates", [])
     next_offset = data.get("data", {}).get("next_offset_id")
-
-    logger.info(f"[POLL] Received {len(updates)} update(s). next_offset={next_offset}")
-
-    # Always ensure admin is a subscriber
-    if ADMIN_CHAT_ID:
-        if ADMIN_CHAT_ID not in subscribers:
-            logger.info(f"[SUBSCRIBER] Adding ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
-            subscribers.add(ADMIN_CHAT_ID)
-
-    # Diff: find chat_ids we've never seen before
-    found_ids = extract_chat_ids_from_updates(updates)
-    new_ids = found_ids - subscribers
-    logger.info(f"[POLL] Found {len(found_ids)} chat_id(s) in updates, {len(new_ids)} are new")
-
-    _welcome_and_register(new_ids, subscribers)
-
+    
+    logger.info(f"📬 Received {len(updates)} updates from Rubika")
+    
+    # Extract and process new subscribers
+    new_users = extract_new_subscribers(updates, subscribers)
+    
+    # Always include admin if configured
+    if ADMIN_CHAT_ID and ADMIN_CHAT_ID not in subscribers:
+        logger.info(f"👮 Adding admin chat_id: {ADMIN_CHAT_ID}")
+        subscribers.add(ADMIN_CHAT_ID)
+    
+    # Add new subscribers and push to repo immediately
+    _add_new_subscribers_and_push(new_users, subscribers)
+    
+    # Update offset for next polling cycle
     if next_offset:
         state["rubika_offset"] = next_offset
         save_state(state)
-        logger.debug(f"[POLL] Offset advanced to {next_offset}")
-
+        logger.debug(f"📍 Updated rubika_offset to: {next_offset}")
+    
+    logger.info("✅ fetch_updates completed successfully")
     return subscribers, state
-
 
 # ─────────────────────────────────────────────
 # MEDIA
 # ─────────────────────────────────────────────
-def get_file_type(media) -> str:
+def get_file_type(media):
+    """Determine file type for Rubika upload"""
     if getattr(media, "photo", None):
         return "Image"
     if getattr(media, "video", None):
@@ -531,293 +483,339 @@ def get_file_type(media) -> str:
         return "Music"
     return "File"
 
-
 # ─────────────────────────────────────────────
 # BROADCAST
 # ─────────────────────────────────────────────
-def broadcast_text(subscribers: set, text: str, meta_parts: list = None):
+def broadcast_text(subscribers, text):
+    """Broadcast text message to all subscribers"""
     results = []
+    logger.info(f"📢 Broadcasting text to {len(subscribers)} subscribers")
+    
     for chat_id in list(subscribers):
-        ok, msg_id = send_text(chat_id, text, meta_parts)
-        if ok and msg_id:
-            results.append({
-                "chat_id": chat_id,
-                "msg_id": msg_id,
-                "full_text": text,
-                "meta_parts": meta_parts or [],
-            })
+        try:
+            ok, msg_id = send_text(chat_id, text)
+            if ok and msg_id:
+                results.append({"chat_id": chat_id, "msg_id": msg_id, "full_text": text})
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast to {chat_id}: {e}")
+    
+    logger.info(f"✅ Broadcast completed: {len(results)}/{len(subscribers)} successful")
     return results
 
-
-def broadcast_file(subscribers: set, file_id: str, caption: str, meta_parts: list = None):
+def broadcast_file(subscribers, file_id, caption):
+    """Broadcast file to all subscribers"""
     results = []
+    logger.info(f"📎 Broadcasting file {file_id} to {len(subscribers)} subscribers")
+    
     for chat_id in list(subscribers):
-        ok, msg_id = send_file(chat_id, file_id, caption, meta_parts)
-        if ok and msg_id:
-            results.append({
-                "chat_id": chat_id,
-                "msg_id": msg_id,
-                "full_text": caption,
-                "meta_parts": meta_parts or [],
-            })
+        try:
+            ok, msg_id = send_file(chat_id, file_id, caption)
+            if ok and msg_id:
+                results.append({"chat_id": chat_id, "msg_id": msg_id, "full_text": caption})
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast file to {chat_id}: {e}")
+    
+    logger.info(f"✅ File broadcast completed: {len(results)}/{len(subscribers)} successful")
     return results
-
 
 # ─────────────────────────────────────────────
 # REACTIONS
 # ─────────────────────────────────────────────
 pending_edits = {}
 
-
-async def delayed_reaction_updates(client, channel_name: str, tg_msg_id: int):
+async def delayed_reaction_updates(client, channel_name, tg_msg_id):
+    """Periodically update messages with reaction counts"""
     key = (channel_name, tg_msg_id)
     start = time.monotonic()
-
+    
     for seconds, label in REACTION_EDIT_SCHEDULE:
         wait = seconds - (time.monotonic() - start)
         if wait > 0:
             await asyncio.sleep(wait)
-
+        
         entries = pending_edits.get(key)
         if not entries:
+            logger.debug(f"⏭️ No pending edits for {key}, stopping reaction updates")
             return
-
+        
         try:
             msg = await client.get_messages(channel_name, ids=tg_msg_id)
             if not msg:
                 continue
-
+            
             reactions = get_top_reactions(msg)
             if not reactions:
                 continue
-
+            
             for entry in entries:
                 new_text = f"{entry['full_text']}\n\n💬 {reactions}"
-                edit_text(
-                    entry["chat_id"],
-                    entry["msg_id"],
-                    new_text,
-                    entry.get("meta_parts") or None,
-                )
-
-            logger.info(f"[REACTION] Edit {label}: {channel_name} msg#{tg_msg_id}")
-
+                edit_text(entry["chat_id"], entry["msg_id"], new_text)
+            
+            logger.info(f"⭐ Reaction edit {label}: {channel_name}#{tg_msg_id}")
+            
         except Exception as e:
-            logger.error(f"[REACTION] Edit error: {e}")
-
+            logger.error(f"❌ Reaction update error: {e}")
+    
     pending_edits.pop(key, None)
-
+    logger.debug(f"🧹 Cleaned up pending edits for {key}")
 
 # ─────────────────────────────────────────────
 # FORWARD
 # ─────────────────────────────────────────────
-async def forward_message(client, message, channel_name: str, state: dict, subscribers: set):
+async def forward_message(client, message, channel_name, state, subscribers):
+    """Forward Telegram message to Rubika subscribers with proper formatting"""
+    
+    # Skip already processed messages
     if message.id <= state.get(channel_name, 0):
+        logger.debug(f"⏭️ Skipping already forwarded message {message.id} from {channel_name}")
         return
-
+    
     if not subscribers:
-        logger.warning(f"[FORWARD] No subscribers — skipping {channel_name} msg#{message.id}")
+        logger.warning(f"⚠️ No subscribers to forward message {message.id} to")
         return
-
-    msg_date = (
-        message.date.replace(tzinfo=timezone.utc)
-        if message.date.tzinfo is None
-        else message.date
-    )
-
-    # ── TEXT ONLY ──
+    
+    # Normalize message date to UTC
+    msg_date = message.date
+    if msg_date.tzinfo is None:
+        msg_date = msg_date.replace(tzinfo=timezone.utc)
+    
+    # ── TEXT MESSAGE ──
     if message.text and not message.media:
-        text, meta_parts = build_message_parts(channel_name, msg_date, message.text)
-        deliveries = broadcast_text(subscribers, text, meta_parts if meta_parts else None)
-
+        logger.info(f"📝 Forwarding text message {message.id} from {channel_name}")
+        
+        text = build_message(channel_name, msg_date, message.text)
+        deliveries = broadcast_text(subscribers, text)
+        
         if deliveries:
             state[channel_name] = message.id
             save_state(state)
+            
+            # Schedule reaction updates
             key = (channel_name, message.id)
             pending_edits[key] = deliveries
             asyncio.create_task(delayed_reaction_updates(client, channel_name, message.id))
-            logger.info(f"[FORWARD] Text msg#{message.id} from {channel_name} → {len(deliveries)} subscriber(s)")
-
+            logger.debug(f"⏰ Scheduled reaction updates for {key}")
         return
-
-    # ── MEDIA ──
+    
+    # ── MEDIA MESSAGE ──
     if not message.media or not message.file:
+        logger.debug(f"⏭️ Skipping message {message.id}: no media or file info")
         return
-
+    
     file_type = get_file_type(message.media)
     max_bytes = MAX_FILE_SIZE_MB.get(file_type, 50) * 1024 * 1024
-
+    
+    # Check file size limit
     if message.file.size > max_bytes:
         size_mb = message.file.size / 1024 / 1024
-        logger.warning(f"[FORWARD] Skipping large {file_type} ({size_mb:.1f} MB) from {channel_name}")
+        logger.warning(f"⚠️ File too large: {size_mb:.1f}MB > {max_bytes/1024/1024:.0f}MB limit")
         broadcast_text(subscribers, build_skip_message(file_type, size_mb))
         return
-
+    
+    # Download and upload file
     try:
+        logger.info(f"⬇️ Downloading media from message {message.id}")
         file_bytes = await client.download_media(message, file=bytes)
     except Exception as e:
-        logger.error(f"[FORWARD] Download failed for {channel_name} msg#{message.id}: {e}")
+        logger.error(f"❌ Download failed for message {message.id}: {e}")
         return
-
+    
     filename = message.file.name or "file.bin"
     file_id = upload_file(file_bytes, filename, file_type)
+    
     if not file_id:
+        logger.error(f"❌ Upload failed for message {message.id}")
         return
-
-    caption, meta_parts = build_message_parts(channel_name, msg_date, message.text or "")
-    deliveries = broadcast_file(subscribers, file_id, caption, meta_parts if meta_parts else None)
-
+    
+    # Build caption with Quote+Mono formatted proxy configs
+    caption = build_message(channel_name, msg_date, message.text or "")
+    deliveries = broadcast_file(subscribers, file_id, caption)
+    
     if deliveries:
         state[channel_name] = message.id
         save_state(state)
+        
         key = (channel_name, message.id)
         pending_edits[key] = deliveries
         asyncio.create_task(delayed_reaction_updates(client, channel_name, message.id))
-        logger.info(f"[FORWARD] Media msg#{message.id} ({file_type}) from {channel_name} → {len(deliveries)} subscriber(s)")
-
+        logger.debug(f"⏰ Scheduled reaction updates for {key}")
 
 # ─────────────────────────────────────────────
-# GIT
+# GIT OPERATIONS
 # ─────────────────────────────────────────────
 def clone_repo():
+    """Clone the private data repo with PAT authentication"""
+    logger.info(f"🔽 Cloning repo: {DATA_REPO_URL}")
+    
     if DATA_REPO_DIR.exists():
+        logger.debug("🗑️ Removing existing data_repo directory")
         shutil.rmtree(DATA_REPO_DIR)
-
+    
+    # Create credential helper script
     helper = Path("/tmp/git-helper.sh")
-    helper.write_text(
-        "#!/bin/sh\n"
-        "echo 'username=x-access-token'\n"
-        f"echo 'password={DATA_REPO_PAT}'\n"
-    )
+    helper.write_text(f"#!/bin/sh\necho 'username=x-access-token'\necho 'password={DATA_REPO_PAT}'\n")
     os.chmod(helper, 0o755)
-
+    
     try:
         subprocess.run(
-            ["git", "-c", f"credential.helper={helper}", "clone", "--depth", "1", DATA_REPO_URL, str(DATA_REPO_DIR)],
-            check=True,
-            capture_output=True,
-            text=True,
+            ["git", "-c", f"credential.helper={helper}", "clone", "--depth", "1", 
+             DATA_REPO_URL, str(DATA_REPO_DIR)],
+            check=True, capture_output=True, text=True
         )
-        logger.info("[GIT] Data repo cloned")
+        logger.info("✅ Data repo cloned successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Git clone failed: {e.stderr}")
+        raise
     finally:
         helper.unlink(missing_ok=True)
 
-
 def push_repo():
+    """Push changes to the private data repo"""
+    logger.info("🔄 Preparing to push changes to repo...")
+    
     try:
-        subprocess.run(["git", "config", "user.email", "actions@github.com"], cwd=DATA_REPO_DIR, check=True)
-        subprocess.run(["git", "config", "user.name", "GitHub Actions"], cwd=DATA_REPO_DIR, check=True)
-        subprocess.run(["git", "add", "."], cwd=DATA_REPO_DIR, check=True)
-
-        diff = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=DATA_REPO_DIR)
+        # Configure git user
+        subprocess.run(["git", "config", "user.email", "actions@github.com"], 
+                      cwd=DATA_REPO_DIR, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "GitHub Actions"], 
+                      cwd=DATA_REPO_DIR, check=True, capture_output=True)
+        
+        # Stage changes
+        subprocess.run(["git", "add", "."], cwd=DATA_REPO_DIR, check=True, capture_output=True)
+        
+        # Check if there are changes to commit
+        diff = subprocess.run(["git", "diff", "--staged", "--quiet"], 
+                             cwd=DATA_REPO_DIR, capture_output=True)
+        
         if diff.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "update subscribers/state"], cwd=DATA_REPO_DIR, check=True)
-            subprocess.run(["git", "push"], cwd=DATA_REPO_DIR, check=True)
-            logger.info("[GIT] Data pushed to remote repo")
+            # Commit and push
+            subprocess.run(["git", "commit", "-m", "update subscribers/state"], 
+                          cwd=DATA_REPO_DIR, check=True, capture_output=True)
+            subprocess.run(["git", "push"], cwd=DATA_REPO_DIR, check=True, capture_output=True)
+            logger.info("✅ Changes pushed to remote repo")
         else:
-            logger.debug("[GIT] Nothing to push (no staged changes)")
-
+            logger.debug("ℹ️ No changes to push")
+            
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Git push failed: {e.stderr}")
     except Exception as e:
-        logger.error(f"[GIT] Push error: {e}")
-
+        logger.error(f"❌ Push error: {e}")
 
 # ─────────────────────────────────────────────
 # CATCHUP
 # ─────────────────────────────────────────────
-async def catchup(client, channels: list, state: dict, subscribers: set):
+async def catchup(client, channels, state, subscribers):
+    """Catch up on missed messages from Telegram channels"""
+    
     if not state:
-        logger.info("[CATCHUP] First run — setting message ID markers for all channels")
+        logger.info("🚀 First run - setting message markers for all channels")
         for channel in channels:
             try:
                 entity = await asyncio.wait_for(client.get_entity(channel), timeout=5.0)
                 msgs = await asyncio.wait_for(client.get_messages(entity, limit=1), timeout=5.0)
                 state[channel] = msgs[0].id if msgs else 0
-                logger.info(f"[CATCHUP] Marker for {channel}: {state[channel]}")
+                logger.info(f"📍 Marker set for {channel}: {state[channel]}")
             except asyncio.TimeoutError:
-                logger.error(f"[CATCHUP] Timeout for {channel} — marker set to 0")
+                logger.error(f"⏰ Timeout accessing {channel} – skipping")
                 state[channel] = 0
             except Exception as e:
-                logger.error(f"[CATCHUP] Error for {channel}: {e} — marker set to 0")
+                logger.error(f"❌ Error with {channel}: {e}")
                 state[channel] = 0
         save_state(state)
         return
-
-    logger.info("[CATCHUP] Catching up missed messages…")
+    
+    # Normal catch-up: fetch recent messages
+    logger.info("🔄 Catching up on recent messages...")
     for channel in channels:
         try:
             entity = await asyncio.wait_for(client.get_entity(channel), timeout=5.0)
             msgs = await asyncio.wait_for(client.get_messages(entity, limit=10), timeout=5.0)
-            forwarded = 0
-            for msg in reversed(msgs):
+            
+            for msg in reversed(msgs):  # Process oldest first
                 if msg.id <= state.get(channel, 0):
                     continue
+                logger.info(f"📬 Catching up message {msg.id} from {channel}")
                 await forward_message(client, msg, channel, state, subscribers)
-                forwarded += 1
-            if forwarded:
-                logger.info(f"[CATCHUP] Forwarded {forwarded} message(s) from {channel}")
+                
         except asyncio.TimeoutError:
-            logger.error(f"[CATCHUP] Timeout catching up on {channel} — skipping")
+            logger.error(f"⏰ Timeout catching up on {channel} – skipping")
         except Exception as e:
-            logger.error(f"[CATCHUP] Error on {channel}: {e}")
-
+            logger.error(f"❌ Catchup error on {channel}: {e}")
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 async def main():
+    logger.info("🚀 Starting Public Forwarder...")
+    
+    # Initialize repo and load data
     clone_repo()
-
     channels = load_channels()
     state = load_state()
     subscribers = load_subscribers()
-
-    logger.info(f"[MAIN] Loaded {len(subscribers)} subscriber(s), {len(channels)} channel(s)")
-
-    # First poll immediately on startup
+    
+    logger.info(f"📊 Status: {len(channels)} channels, {len(subscribers)} subscribers")
+    
+    # Initial poll for new subscribers (immediate)
+    logger.info("🔄 Running initial subscriber poll...")
     subscribers, state = fetch_updates(subscribers, state)
-
+    
+    # Connect to Telegram
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     await client.start()
-    logger.info("[MAIN] Telegram connected")
-
+    logger.info("✅ Telegram client connected")
+    
+    # Catch up on missed messages
     await catchup(client, channels, state, subscribers)
-
+    
+    # Register message handler for real-time forwarding
     @client.on(events.NewMessage(chats=channels))
     async def new_message(event):
         try:
             chat = await event.get_chat()
             channel_name = chat.title or chat.username or str(chat.id)
+            logger.info(f"📨 New message detected from {channel_name} (id: {event.message.id})")
             await forward_message(client, event.message, channel_name, state, subscribers)
         except Exception as e:
-            logger.error(f"[HANDLER] Error: {e}")
-
+            logger.error(f"❌ Handler error: {e}")
+    
+    # Background task: poll Rubika for new subscribers every 1 minute
     async def poll_subscribers():
         nonlocal subscribers, state
+        poll_count = 0
+        
         while True:
-            await asyncio.sleep(SUBSCRIBER_REFRESH_INTERVAL)
+            poll_count += 1
+            logger.info(f"🔄 Poll #{poll_count}: Fetching Rubika updates...")
+            
             try:
-                logger.info("[POLL] Running scheduled subscriber poll…")
                 subscribers, state = fetch_updates(subscribers, state)
+                logger.info(f"✅ Poll #{poll_count} completed - {len(subscribers)} total subscribers")
             except Exception as e:
-                logger.error(f"[POLL] Error during scheduled poll: {e}")
-
+                logger.error(f"❌ Poll #{poll_count} error: {e}")
+            
+            await asyncio.sleep(SUBSCRIBER_REFRESH_INTERVAL)
+    
+    # Start polling task
     asyncio.create_task(poll_subscribers())
-
+    logger.info(f"⏱️ Subscriber polling started (interval: {SUBSCRIBER_REFRESH_INTERVAL}s)")
+    
+    # Main loop: run for configured duration
     start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= RUN_DURATION:
-            logger.info(f"[MAIN] Run duration ({RUN_DURATION}s) reached — shutting down")
-            break
+    logger.info(f"⏰ Running for {RUN_DURATION} seconds...")
+    
+    while time.monotonic() - start < RUN_DURATION:
         await asyncio.sleep(30)
-
+        logger.debug("❤️ Heartbeat - forwarder still running")
+    
+    # Cleanup: save state and push final changes
+    logger.info("🛑 Run duration reached, saving state and pushing changes...")
     save_state(state)
     save_subscribers(subscribers)
     push_repo()
-
+    
     await client.disconnect()
-    logger.info("[MAIN] Finished cleanly")
-
+    logger.info("✅ Public Forwarder finished successfully")
 
 if __name__ == "__main__":
     asyncio.run(main())
