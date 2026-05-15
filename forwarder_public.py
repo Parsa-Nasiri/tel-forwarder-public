@@ -27,7 +27,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 # CONFIG
 # ─────────────────────────────────────────────
 RUN_DURATION = 20400
-SUBSCRIBER_REFRESH_INTERVAL = 60  # Poll Rubika getUpdates every 1 minute
+SUBSCRIBER_REFRESH_INTERVAL = 60  # Poll every 1 minute
 REACTION_EDIT_SCHEDULE = [
     (180,  "3m "),
     (300,  "5m "),
@@ -66,6 +66,7 @@ DATA_REPO_DIR = Path("data_repo")
 STATE_FILE = DATA_REPO_DIR / "state.json"
 SUBSCRIBERS_FILE = DATA_REPO_DIR / "subscribers.json"
 CHANNELS_FILE = Path("channels.json")
+SEEN_UPDATES_FILE = DATA_REPO_DIR / "seen_updates.json"  # Track processed update IDs
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -81,32 +82,37 @@ logger = logging.getLogger("forwarder")
 # MARKDOWN & FORMATTING (Quote + Mono for Rubika)
 # ─────────────────────────────────────────────
 def md_bold(text):
+    """Bold text using Markdown *text*"""
     return f"*{text}*"
 
 def md_italic(text):
+    """Italic text using Markdown _text_"""
     return f"_{text}_"
 
 def md_mono(text):
-    # Using backticks for monospace (Markdown compatible with Rubika parse_mode="Markdown")
-    return f"`{text}`"
+    """Monospace using backticks `text`"""
+    # Escape backticks in content to prevent breaking formatting
+    escaped = str(text).replace("`", "\\`")
+    return f"`{escaped}`"
 
 def md_quote(text):
-    # Using > prefix for quote blocks (Markdown compatible)
-    lines = text.split('\n')
-    return '\n'.join(f"> {line}" for line in lines)
+    """Quote block using > prefix per line"""
+    lines = str(text).split('\n')
+    return '\n'.join(f"> {line}" for line in lines if line.strip())
 
-def md_code(text):
-    # For multi-line code blocks, use triple backticks
-    return f"```\n{text}\n```"
+def md_code_block(text):
+    """Multi-line code block using triple backticks"""
+    escaped = str(text).replace("```", "\\`\\`\\`")
+    return f"```\n{escaped}\n```"
 
 def is_proxy_line(line):
-    """Check if a line is a VPN/proxy config line"""
+    """Check if a line is a VPN/proxy config"""
     line = line.strip().lower()
     return any(line.startswith(prefix) for prefix in VPN_PREFIXES)
 
 def format_proxy_text(text):
     """
-    Format proxy configs with Quote + Mono formatting.
+    Format proxy configs with Quote + Mono.
     Handles bulk IPs sent consecutively or with line breaks.
     """
     if not text:
@@ -119,7 +125,7 @@ def format_proxy_text(text):
     def flush_proxy_buffer():
         nonlocal proxy_buffer
         if proxy_buffer:
-            # Apply Mono formatting to each proxy line, then wrap in Quote block
+            # Apply Mono to each line, then wrap entire block in Quote
             mono_lines = [md_mono(line) for line in proxy_buffer]
             quoted_block = md_quote('\n'.join(mono_lines))
             result.append(quoted_block)
@@ -127,54 +133,80 @@ def format_proxy_text(text):
 
     for line in lines:
         stripped = line.strip()
-        
         if is_proxy_line(stripped):
-            # Clean the line and add to buffer
             proxy_buffer.append(stripped)
         else:
             flush_proxy_buffer()
-            if stripped:  # Only add non-empty non-proxy lines
+            if stripped:
                 result.append(line)
-
+    
     flush_proxy_buffer()
-    return '\n'.join(result)
+    return '\n\n'.join(result) if result else ""
 
 # ─────────────────────────────────────────────
-# UX
+# UX - IMPROVED MESSAGES
 # ─────────────────────────────────────────────
 def build_header(channel_name, msg_date):
+    """Beautiful header with channel name and timestamp"""
     date_str = msg_date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📡 {md_bold(channel_name)}\n"
-        f"🕐 {md_italic(date_str)}\n"
-        "━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡  {md_bold(channel_name)}\n"
+        f"🕐  {md_italic(date_str)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 def build_message(channel_name, msg_date, body):
+    """Complete message with header and formatted body"""
     header = build_header(channel_name, msg_date)
-    body = format_proxy_text(body)
+    formatted_body = format_proxy_text(body)
     
-    if body:
-        return f"{header}\n\n{body}"
+    if formatted_body:
+        return f"{header}\n\n{formatted_body}"
     return header
 
-def build_welcome():
-    """Welcome message for newly accepted users"""
-    return (
-        f"{md_bold('شما پذیرفته شدید')}\n\n"
-        "کانفیگ‌های جدید به‌صورت خودکار ارسال می‌شوند.\n\n"
-        "لینک‌های پروکسی داخل بخش قابل‌کپی قرار می‌گیرند."
+def build_welcome(chat_id=None):
+    """
+    Welcome message for newly accepted users.
+    Clear, friendly, with instructions.
+    """
+    welcome_text = (
+        "✨ *شما پذیرفته شدید!* ✨\n\n"
+        "✅ کانفیگ‌های جدید به‌صورت *خودکار* برایتان ارسال می‌شود.\n"
+        "📋 لینک‌های پروکسی داخل بخش *قابل‌کپی* قرار می‌گیرند.\n"
+        "🔄 برای دریافت کانفیگ‌های قدیمی، دستور /configs را ارسال کنید.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 *راهنمای سریع:*\n"
+        "• کانفیگ‌ها با فرمت `mono` ارسال می‌شوند تا راحت کپی کنید.\n"
+        "• اگر پیامی را از دست دادید، مجدد /start بزنید.\n"
+        "• برای پشتیبانی، به ادمین پیام دهید.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎉 *موفق باشید!*"
     )
+    return welcome_text
 
 def build_skip_message(file_type, size_mb):
+    """Message when file is too large to forward"""
     return (
         f"⚠️ {md_bold('فایل بزرگ رد شد')}\n\n"
-        f"نوع: {md_mono(file_type)}\n"
-        f"حجم: {md_mono(f'{size_mb:.1f} MB')}"
+        f"> نوع: {md_mono(file_type)}\n"
+        f"> حجم: {md_mono(f'{size_mb:.1f} MB')}\n\n"
+        "فایل‌های بزرگ‌تر از حد مجاز ارسال نمی‌شوند."
     )
 
+def build_config_request_response(configs):
+    """Response when user requests old configs"""
+    if not configs:
+        return "📭 *کانفیگی برای ارسال یافت نشد.*\nلطفاً کمی صبر کنید تا کانفیگ‌های جدید اضافه شوند."
+    
+    header = "📦 *کانفیگ‌های اخیر:*\n" + "━" * 30
+    config_block = format_proxy_text('\n'.join(configs[:10]))  # Limit to 10 configs
+    footer = f"\n\n> نمایش {min(len(configs), 10)} از {len(configs)} کانفیگ"
+    
+    return f"{header}\n\n{config_block}{footer}"
+
 def get_top_reactions(message):
+    """Extract top 3 reactions from Telegram message"""
     if not message.reactions or not message.reactions.results:
         return ""
     
@@ -189,54 +221,77 @@ def get_top_reactions(message):
     return "  ".join(f"{emoji} {md_bold(str(count))}" for emoji, count in top)
 
 # ─────────────────────────────────────────────
-# FILES
+# FILES & STATE
 # ─────────────────────────────────────────────
 def load_channels():
+    """Load Telegram channels to monitor"""
     if not CHANNELS_FILE.exists():
         logger.error("❌ channels.json not found")
         sys.exit(1)
     with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
         channels = json.load(f)
+        # Clean whitespace from channel names
+        channels = [ch.strip() for ch in channels if ch.strip()]
         logger.info(f"✅ Loaded {len(channels)} channels: {channels}")
         return channels
 
 def load_state():
+    """Load forwarding state (last processed message IDs)"""
     if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
-            logger.debug(f"📦 Loaded state with {len(state)} entries")
+            logger.debug(f"📦 Loaded state with {len(state)} channel markers")
             return state
     logger.info("📦 No state file found, starting fresh")
     return {}
 
 def save_state(state):
+    """Save forwarding state"""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     logger.debug(f"💾 State saved to {STATE_FILE}")
 
 def load_subscribers():
-    """Load existing subscribers from the private repo file"""
+    """Load existing Rubika subscribers from repo"""
     if SUBSCRIBERS_FILE.exists():
         with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
             subs = set(json.load(f))
-            logger.info(f"👥 Loaded {len(subs)} existing subscribers from repo")
+            logger.info(f"👥 Loaded {len(subs)} existing subscribers")
             return subs
-    logger.info("👥 No subscribers file found, starting with empty set")
+    logger.info("👥 No subscribers file found, starting empty")
     return set()
 
 def save_subscribers(subscribers):
-    """Save subscribers to the private repo file"""
+    """Save subscribers list to repo file"""
     SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(subscribers), f, ensure_ascii=False, indent=2)
     logger.info(f"💾 Saved {len(subscribers)} subscribers to {SUBSCRIBERS_FILE}")
 
+def load_seen_updates():
+    """Load set of already-processed Rubika update IDs to avoid duplicates"""
+    if SEEN_UPDATES_FILE.exists():
+        with open(SEEN_UPDATES_FILE, "r", encoding="utf-8") as f:
+            seen = set(json.load(f))
+            logger.debug(f"🔍 Loaded {len(seen)} seen update IDs")
+            return seen
+    return set()
+
+def save_seen_updates(seen_ids):
+    """Save processed update IDs (limit to last 1000 to prevent file bloat)"""
+    SEEN_UPDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Keep only recent IDs to prevent unbounded growth
+    recent_ids = list(seen_ids)[-1000:] if len(seen_ids) > 1000 else list(seen_ids)
+    with open(SEEN_UPDATES_FILE, "w", encoding="utf-8") as f:
+        json.dump(recent_ids, f, ensure_ascii=False)
+    logger.debug(f"💾 Saved {len(recent_ids)} seen update IDs")
+
 # ─────────────────────────────────────────────
 # RUBIKA API
 # ─────────────────────────────────────────────
 def rubika_post(method, payload=None, timeout=20):
-    """Make POST request to Rubika Bot API"""
+    """Make POST request to Rubika Bot API with error handling"""
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/{method}"
     try:
         logger.debug(f"🔗 Calling Rubika API: {method}")
@@ -250,12 +305,18 @@ def rubika_post(method, payload=None, timeout=20):
         logger.debug(f"✅ {method} response status: {result.get('status')}")
         return result
         
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ {method} timeout after {timeout}s")
+        return None
+    except requests.exceptions.RequestException as e:
         logger.error(f"❌ {method} request error: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ {method} invalid JSON response: {e}")
         return None
 
 def send_text(chat_id, text):
-    """Send text message via Rubika Bot API with Markdown parse_mode"""
+    """Send text message via Rubika Bot API with Markdown parsing"""
     logger.info(f"📤 Sending text to chat_id: {chat_id}")
     data = rubika_post("sendMessage", {
         "chat_id": chat_id,
@@ -272,7 +333,8 @@ def send_text(chat_id, text):
         logger.info(f"✅ Message sent to {chat_id}, msg_id: {msg_id}")
         return True, msg_id
     
-    logger.error(f"❌ sendMessage returned non-OK status: {data}")
+    error_msg = data.get("data", {}).get("error", "Unknown error")
+    logger.error(f"❌ sendMessage failed for {chat_id}: {error_msg}")
     return False, None
 
 def edit_text(chat_id, message_id, text):
@@ -307,7 +369,7 @@ def send_file(chat_id, file_id, caption):
         logger.info(f"✅ File sent to {chat_id}, msg_id: {msg_id}")
         return True, msg_id
     
-    logger.error(f"❌ sendFile returned non-OK status: {data}")
+    logger.error(f"❌ sendFile failed for {chat_id}: {data}")
     return False, None
 
 def upload_file(file_bytes, filename, file_type):
@@ -349,11 +411,14 @@ def upload_file(file_bytes, filename, file_type):
     return None
 
 # ─────────────────────────────────────────────
-# GET UPDATES & SUBSCRIBER MANAGEMENT
+# GET UPDATES & SUBSCRIBER MANAGEMENT (FIXED)
 # ─────────────────────────────────────────────
-def extract_new_subscribers(updates, existing_subscribers):
-    """Extract new chat_ids from Rubika updates"""
-    new_users = set()
+def extract_new_subscribers(updates, existing_subscribers, seen_update_ids):
+    """
+    Extract new chat_ids from Rubika updates.
+    FIXED: Properly handles StartedBot events and avoids duplicates.
+    """
+    new_users = {}  # chat_id -> update_type for logging
     logger.debug(f"🔍 Processing {len(updates)} updates for new subscribers")
     
     for update in updates:
@@ -361,17 +426,24 @@ def extract_new_subscribers(updates, existing_subscribers):
         if not chat_id:
             continue
         
-        update_type = update.get("type", "")
-        
-        # Case 1: User started the bot (StartedBot event)
-        if update_type == "StartedBot":
-            if chat_id not in existing_subscribers:
-                logger.info(f"🆕 New subscriber via StartedBot: {chat_id}")
-                new_users.add(chat_id)
+        # Generate unique update identifier to avoid reprocessing
+        update_key = f"{chat_id}:{update.get('update_time', '')}:{update.get('type', '')}"
+        if update_key in seen_update_ids:
+            logger.debug(f"⏭️ Skipping already processed update: {update_key}")
             continue
         
+        update_type = update.get("type", "")
+        is_new_subscriber = False
+        
+        # Case 1: User started the bot (StartedBot event) - PRIMARY detection
+        if update_type == "StartedBot":
+            if chat_id not in existing_subscribers:
+                logger.info(f"🆕 NEW subscriber via StartedBot: {chat_id}")
+                new_users[chat_id] = "StartedBot"
+                is_new_subscriber = True
+        
         # Case 2: User sent /start message or clicked start button
-        if update_type == "NewMessage":
+        elif update_type == "NewMessage":
             msg = update.get("new_message", {})
             text = str(msg.get("text", "")).strip().lower()
             aux_data = msg.get("aux_data", {})
@@ -379,77 +451,94 @@ def extract_new_subscribers(updates, existing_subscribers):
             
             if text == "/start" or button_id == "start":
                 if chat_id not in existing_subscribers:
-                    logger.info(f"🆕 New subscriber via /start: {chat_id}")
-                    new_users.add(chat_id)
+                    logger.info(f"🆕 NEW subscriber via /start: {chat_id}")
+                    new_users[chat_id] = "NewMessage"
+                    is_new_subscriber = True
+        
+        # Mark this update as seen if it was a potential subscriber event
+        if is_new_subscriber or update_type in ("StartedBot", "NewMessage"):
+            seen_update_ids.add(update_key)
     
     logger.info(f"📊 Found {len(new_users)} new subscribers in this batch")
-    return new_users
+    return new_users, seen_update_ids
 
-def _add_new_subscribers_and_push(new_users, subscribers):
+def _add_new_subscribers_and_push(new_users_dict, subscribers):
     """
     Add new subscribers, send welcome message, save to repo, and push immediately.
     Includes extensive logging as requested.
     """
-    if not new_users:
+    if not new_users_dict:
         logger.debug("ℹ️ No new subscribers to process")
         return
     
-    logger.info(f"🚀 Processing {len(new_users)} new subscriber(s)")
+    logger.info(f"🚀 Processing {len(new_users_dict)} new subscriber(s)")
+    added_count = 0
     
-    for chat_id in sorted(new_users):
+    for chat_id, source in sorted(new_users_dict.items()):
         try:
-            logger.info(f"👤 Adding new subscriber: {chat_id}")
+            logger.info(f"👤 Adding new subscriber: {chat_id} (via {source})")
             
-            # Send welcome message: "شما پذیرفته شدید"
-            ok, msg_id = send_text(chat_id, build_welcome())
+            # Send beautiful welcome message: "شما پذیرفته شدید"
+            ok, msg_id = send_text(chat_id, build_welcome(chat_id))
             
             if ok and msg_id:
                 subscribers.add(chat_id)
-                logger.info(f"✅ Welcome message sent to {chat_id} (msg_id: {msg_id})")
+                added_count += 1
+                logger.info(f"✅ Welcome sent to {chat_id} (msg_id: {msg_id})")
             else:
-                logger.warning(f"⚠️ Failed to send welcome to {chat_id}, but still adding to list")
+                logger.warning(f"⚠️ Failed to send welcome to {chat_id}, but adding to list anyway")
                 subscribers.add(chat_id)  # Add anyway to avoid repeated attempts
                 
         except Exception as e:
             logger.error(f"❌ Error processing subscriber {chat_id}: {e}")
             continue
     
-    # Save updated subscribers list to local repo file
-    logger.info(f"💾 Saving {len(subscribers)} total subscribers to {SUBSCRIBERS_FILE}")
-    save_subscribers(subscribers)
-    
-    # Push to remote repo immediately to sync new subscribers
-    logger.info("🔄 Pushing updated subscribers to remote repo...")
-    push_repo()
-    logger.info("✅ Repo push completed")
+    if added_count > 0:
+        # Save updated subscribers list to local repo file
+        logger.info(f"💾 Saving {len(subscribers)} total subscribers to {SUBSCRIBERS_FILE}")
+        save_subscribers(subscribers)
+        
+        # Push to remote repo immediately to sync new subscribers
+        logger.info("🔄 Pushing updated subscribers to remote repo...")
+        push_repo()
+        logger.info("✅ Repo push completed")
+    else:
+        logger.warning("⚠️ No subscribers were successfully added")
 
-def fetch_updates(subscribers, state):
+def fetch_updates(subscribers, state, seen_update_ids):
     """
     Fetch updates from Rubika Bot API every 1 minute.
-    Compares new chat_ids with existing ones and adds new subscribers.
+    FIXED: Better offset handling and duplicate prevention.
     """
     logger.info("🔄 Fetching updates from Rubika (getUpdates)...")
     
-    payload = {"limit": 200, "state": "all"}
-    offset_id = state.get("rubika_offset")
-    
-    if offset_id:
-        payload["offset_id"] = offset_id
-        logger.debug(f"📍 Using offset_id: {offset_id}")
+    # Build payload - DON'T use offset_id for subscriber detection to catch all new users
+    # Instead, we use seen_update_ids to prevent duplicates
+    payload = {
+        "limit": 200,
+        "state": "all",
+        # Note: We intentionally omit offset_id here to ensure we catch StartedBot events
+        # The seen_update_ids set prevents reprocessing the same events
+    }
     
     data = rubika_post("getUpdates", payload, timeout=40)
     
     if not data:
-        logger.warning("⚠️ getUpdates returned no data")
-        return subscribers, state
+        logger.warning("⚠️ getUpdates returned no data or error")
+        return subscribers, state, seen_update_ids
     
     updates = data.get("data", {}).get("updates", [])
     next_offset = data.get("data", {}).get("next_offset_id")
     
     logger.info(f"📬 Received {len(updates)} updates from Rubika")
     
-    # Extract and process new subscribers
-    new_users = extract_new_subscribers(updates, subscribers)
+    # Log raw update types for debugging
+    if updates:
+        update_types = [u.get("type") for u in updates]
+        logger.debug(f"📋 Update types received: {update_types}")
+    
+    # Extract and process new subscribers WITH seen_update_ids tracking
+    new_users_dict, seen_update_ids = extract_new_subscribers(updates, subscribers, seen_update_ids)
     
     # Always include admin if configured
     if ADMIN_CHAT_ID and ADMIN_CHAT_ID not in subscribers:
@@ -457,16 +546,20 @@ def fetch_updates(subscribers, state):
         subscribers.add(ADMIN_CHAT_ID)
     
     # Add new subscribers and push to repo immediately
-    _add_new_subscribers_and_push(new_users, subscribers)
+    _add_new_subscribers_and_push(new_users_dict, subscribers)
     
-    # Update offset for next polling cycle
+    # Save seen updates to prevent reprocessing
+    if seen_update_ids:
+        save_seen_updates(seen_update_ids)
+    
+    # Update offset for next polling cycle (for general update tracking)
     if next_offset:
         state["rubika_offset"] = next_offset
         save_state(state)
         logger.debug(f"📍 Updated rubika_offset to: {next_offset}")
     
     logger.info("✅ fetch_updates completed successfully")
-    return subscribers, state
+    return subscribers, state, seen_update_ids
 
 # ─────────────────────────────────────────────
 # MEDIA
@@ -753,12 +846,13 @@ async def main():
     channels = load_channels()
     state = load_state()
     subscribers = load_subscribers()
+    seen_update_ids = load_seen_updates()  # NEW: Track processed updates
     
-    logger.info(f"📊 Status: {len(channels)} channels, {len(subscribers)} subscribers")
+    logger.info(f"📊 Status: {len(channels)} channels, {len(subscribers)} subscribers, {len(seen_update_ids)} seen updates")
     
-    # Initial poll for new subscribers (immediate)
+    # Initial poll for new subscribers (immediate) - FIXED: without offset to catch all
     logger.info("🔄 Running initial subscriber poll...")
-    subscribers, state = fetch_updates(subscribers, state)
+    subscribers, state, seen_update_ids = fetch_updates(subscribers, state, seen_update_ids)
     
     # Connect to Telegram
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -781,7 +875,7 @@ async def main():
     
     # Background task: poll Rubika for new subscribers every 1 minute
     async def poll_subscribers():
-        nonlocal subscribers, state
+        nonlocal subscribers, state, seen_update_ids
         poll_count = 0
         
         while True:
@@ -789,7 +883,7 @@ async def main():
             logger.info(f"🔄 Poll #{poll_count}: Fetching Rubika updates...")
             
             try:
-                subscribers, state = fetch_updates(subscribers, state)
+                subscribers, state, seen_update_ids = fetch_updates(subscribers, state, seen_update_ids)
                 logger.info(f"✅ Poll #{poll_count} completed - {len(subscribers)} total subscribers")
             except Exception as e:
                 logger.error(f"❌ Poll #{poll_count} error: {e}")
@@ -812,6 +906,7 @@ async def main():
     logger.info("🛑 Run duration reached, saving state and pushing changes...")
     save_state(state)
     save_subscribers(subscribers)
+    save_seen_updates(seen_update_ids)
     push_repo()
     
     await client.disconnect()
