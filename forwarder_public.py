@@ -226,16 +226,86 @@ def save_subscribers(subscribers: set):
 # ─────────────────────────────────────────────
 # RUBIKA API CLIENT
 # ─────────────────────────────────────────────
-def rubika_post(method: str, payload: dict = None, timeout: int = 20) -> dict:
-    """Make POST request to Rubika Bot API with error handling."""
+# ─────────────────────────────────────────────
+# RUBIKA API CLIENT - FIXED WITH BETTER ERROR HANDLING
+# ─────────────────────────────────────────────
+def rubika_post(method: str, payload: dict = None, timeout: int = 20, max_retries: int = 3) -> dict:
+    """
+    Make POST request to Rubika Bot API with retry logic and detailed error logging.
+    """
     url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/{method}"
-    try:
-        logger.debug(f"🔗 Calling Rubika API: {method}")
-        response = requests.post(url, json=payload or {}, timeout=timeout)
-        
-        if response.status_code != 200:
-            logger.error(f"❌ {method} HTTP {response.status_code}: {response.text[:300]}")
+    
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"🔗 Calling Rubika API: {method} (attempt {attempt+1}/{max_retries})")
+            logger.debug(f"📦 Payload: {json.dumps(payload or {}, indent=2)[:500]}")
+            
+            response = requests.post(url, json=payload or {}, timeout=timeout)
+            
+            # Log raw response for debugging
+            response_text = response.text[:1000] if response.text else "(empty)"
+            logger.debug(f"📥 Raw response (HTTP {response.status_code}): {response_text}")
+            
+            if response.status_code != 200:
+                logger.error(f"❌ {method} HTTP {response.status_code}: {response_text}")
+                if response.status_code in (429, 502, 503, 504):
+                    # Retry on rate limit or server error
+                    wait_time = 2 ** attempt  # Exponential backoff: 2s, 4s, 8s
+                    logger.warning(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                return None
+            
+            # Parse JSON response
+            try:
+                result = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ {method} invalid JSON: {e} | Response: {response_text}")
+                return None
+            
+            logger.debug(f"✅ {method} parsed response status: {result.get('status')}")
+            
+            # Check for API-level errors (not HTTP errors)
+            if result.get("status") != "OK":
+                error_data = result.get("data", {})
+                error_msg = error_data.get("error", error_data.get("message", "Unknown API error"))
+                error_code = error_data.get("code", "N/A")
+                logger.error(f"❌ {method} API error [{error_code}]: {error_msg}")
+                
+                # Don't retry on auth errors (401, invalid token)
+                if "auth" in error_msg.lower() or "token" in error_msg.lower() or error_code == 401:
+                    logger.critical("🔑 Authentication failed - check RUBIKA_BOT_TOKEN!")
+                    return None
+                
+                # Retry on transient API errors
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⏳ Retrying transient error in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                
+                return None
+            
+            return result
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏰ {method} timeout on attempt {attempt+1}/{max_retries}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
             return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"🔌 {method} connection error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+        except Exception as e:
+            logger.error(f"❌ {method} unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            return None
+    
+    logger.error(f"❌ {method} failed after {max_retries} attempts")
+    return None
         
         result = response.json()
         logger.debug(f"✅ {method} response status: {result.get('status')}")
