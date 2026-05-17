@@ -337,18 +337,28 @@ def _split_message(text: str) -> list[str]:
     return chunks or [text]
 
 
-async def broadcast_text(text: str, session: aiohttp.ClientSession) -> list:
-    """Send text to all subscribers, splitting if needed. Returns list of (chat_id, message_id)."""
+async def broadcast_text(text: str, session: aiohttp.ClientSession,
+                         metadata: Optional[dict] = None) -> list:
+    """
+    Send text to all subscribers, splitting if needed.
+    Metadata is only sent with the first chunk (offsets are valid there);
+    continuation chunks are sent as plain text with a part indicator.
+    Returns list of (chat_id, last_message_id).
+    """
     chunks = _split_message(text)
     results = []
     for chat_id in list(subscribers):
         last_mid = None
         for i, chunk in enumerate(chunks):
-            suffix = f"  _({i+1}/{len(chunks)})_" if len(chunks) > 1 else ""
-            mid = await rubika_send_message(chat_id, chunk + suffix, session)
+            # Only attach metadata to the first chunk; subsequent chunks are plain
+            chunk_meta = metadata if i == 0 else None
+            if len(chunks) > 1:
+                part_note = "\n\n📄 بخش " + str(i + 1) + " از " + str(len(chunks))
+                chunk = chunk + part_note
+            mid = await rubika_send_message(chat_id, chunk, session, metadata=chunk_meta)
             if mid:
                 last_mid = mid
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.12)
         if last_mid:
             results.append((chat_id, last_mid))
         await asyncio.sleep(0.05)
@@ -370,91 +380,282 @@ async def broadcast_file(file_id: str, caption: str,
 # MESSAGE FORMATTING
 # ══════════════════════════════════════════════════════════════
 
-HEADER_LINE = "━━━━━━━━━━━━━━━━━━━━━━━━"
+DIVIDER = "―――――――――――――――――――――――――"
+
+# Map Telethon entity types → Rubika MetadataTypeEnum
+# import lazily to avoid top-level issues
+def _tg_entity_to_rubika_type(ent) -> Optional[str]:
+    """Return Rubika metadata type string for a Telethon MessageEntity, or None to skip."""
+    from telethon.tl.types import (
+        MessageEntityBold, MessageEntityItalic,
+        MessageEntityCode, MessageEntityPre,
+        MessageEntityStrike, MessageEntityUnderline,
+        MessageEntitySpoiler,
+    )
+    if isinstance(ent, MessageEntityBold):      return "Bold"
+    if isinstance(ent, MessageEntityItalic):    return "Italic"
+    if isinstance(ent, MessageEntityCode):      return "Mono"
+    if isinstance(ent, MessageEntityPre):       return "Pre"
+    if isinstance(ent, MessageEntityStrike):    return "Strike"
+    if isinstance(ent, MessageEntityUnderline): return "Underline"
+    if isinstance(ent, MessageEntitySpoiler):   return "Spoiler"
+    return None
+
 
 def _channel_display(entity) -> str:
-    """Return the best display name for a Telegram channel entity."""
+    """Return best display name for a Telegram entity."""
     if entity is None:
-        return "📡 کانال"
-    title = getattr(entity, "title", None) or getattr(entity, "username", None) or "کانال"
-    return title
+        return "کانال"
+    title    = getattr(entity, "title",    None)
+    username = getattr(entity, "username", None)
+    return title or (f"@{username}" if username else "کانال")
 
 
-def format_message(raw_text: str, channel_name: str, timestamp: datetime) -> str:
+def _utf16_len(s: str) -> int:
+    """Length in UTF-16 code units — Rubika metadata uses UTF-16 indexing."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _utf16_to_char(text: str, utf16_offset: int) -> int:
+    """Convert a UTF-16 offset into a Python str character index."""
+    encoded = text.encode("utf-16-le")
+    byte_pos = utf16_offset * 2
+    if byte_pos >= len(encoded):
+        return len(text)
+    return len(encoded[:byte_pos].decode("utf-16-le"))
+
+
+def _strip_raw_markdown(text: str) -> str:
     """
-    Build a beautifully formatted Rubika message.
-
-    Layout:
-    ━━━━━━━━━━━━━━━━━━━━━━━
-    📡 **ChannelName**
-    🕐 _2025-01-01 12:00 UTC_
-    ━━━━━━━━━━━━━━━━━━━━━━━
-
-    <body — VPN lines in `monospace` + >quote>
-
-    ━━━━━━━━━━━━━━━━━━━━━━━
+    Remove any residual raw markdown markers that leaked as plain text
+    (happens when Telegram clients send MarkdownV1 text without entities).
+    Strips ** __ ` ~~ but keeps the content between them.
     """
-    ts_str = timestamp.strftime("%Y-%m-%d  %H:%M UTC")
-    header = (
-        f"{HEADER_LINE}\n"
-        f"📡 **{channel_name}**\n"
-        f"🕐 _{ts_str}_\n"
-        f"{HEADER_LINE}\n\n"
-    )
+    # Bold: **text**
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    # Underline / italic: __text__
+    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+    # Mono: `text`  (single or double backtick)
+    text = re.sub(r'``(.+?)``', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`(.+?)`',   r'\1', text, flags=re.DOTALL)
+    # Strike: ~~text~~
+    text = re.sub(r'~~(.+?)~~', r'\1', text, flags=re.DOTALL)
+    # Orphan markers (no matching pair, just loose * ` chars)
+    text = re.sub(r'(?<!\w)\*{1,2}(?!\w)', '', text)
+    text = re.sub(r'(?<!\w)`(?!\w)',        '', text)
+    return text
 
-    if not raw_text:
-        return header.rstrip()
 
-    lines = raw_text.splitlines()
-    formatted_lines = []
+def _build_body(
+    raw_text: str,
+    tg_entities: list,          # Telethon MessageEntity objects (may be None)
+    base_offset: int,           # UTF-16 offset where body starts in full message
+) -> tuple[str, list[dict]]:
+    """
+    Build the message body:
+    • Strips raw markdown fallback markers from plain text
+    • Converts Telethon entities → Rubika metadata (Bold/Italic/Mono/…)
+    • Detects VPN/IP lines → wraps them in Mono + Quote metadata blocks
+    Returns (plain_body_text, rubika_meta_parts_list)
+    """
+    # 1. Clean residual raw markdown from the plain text
+    clean = _strip_raw_markdown(raw_text)
+    lines = clean.splitlines()
 
-    # Group consecutive VPN lines together for a clean block
-    vpn_buffer = []
+    # 2. Classify lines: vpn/ip → mono+quote block; others → plain
+    #    We rebuild the body text from classified segments.
+    segments: list[tuple[str, list[str]]] = []  # (text, [RubikaTypes])
+    vpn_buf: list[str] = []
 
     def flush_vpn():
-        if not vpn_buffer:
+        if not vpn_buf:
             return
-        block = "\n".join(vpn_buffer)
-        formatted_lines.append(f"`{block}`")
-        # Each line also as quote — Rubika uses >line syntax
-        for vl in vpn_buffer:
-            pass  # already in mono block above
-        vpn_buffer.clear()
+        segments.append(("\n".join(vpn_buf), ["Mono", "Quote"]))
+        vpn_buf.clear()
 
     for line in lines:
-        stripped = line.strip()
-        if VPN_SCHEMES.match(stripped):
-            vpn_buffer.append(stripped)
+        s = line.strip()
+        if s and VPN_SCHEMES.match(s):
+            vpn_buf.append(s)
         else:
             flush_vpn()
-            formatted_lines.append(line)
+            # Keep empty lines so paragraphs are preserved
+            segments.append((s, []))
 
     flush_vpn()
 
-    body = "\n".join(formatted_lines)
-    footer = f"\n\n{HEADER_LINE}"
-    return header + body + footer
+    # 3. Stitch segments → plain_body + structural (VPN) meta
+    plain_parts: list[str] = []
+    body_cursor = 0          # UTF-16 cursor relative to body start
+    struct_meta: list[dict] = []
+
+    for i, (seg, types) in enumerate(segments):
+        if i > 0:
+            plain_parts.append("\n")
+            body_cursor += 1
+        seg_u16 = _utf16_len(seg)
+        for t in types:
+            if seg_u16 > 0:
+                struct_meta.append({
+                    "type":       t,
+                    "from_index": base_offset + body_cursor,
+                    "length":     seg_u16,
+                })
+        plain_parts.append(seg)
+        body_cursor += seg_u16
+
+    plain_body = "".join(plain_parts)
+
+    # 4. Map Telethon entities → Rubika metadata
+    #    Telethon entity offsets are UTF-16 into the ORIGINAL raw_text.
+    #    We apply them to the clean text (minimal change since we only stripped
+    #    markdown markers which shift offsets slightly — but in practice
+    #    Telegram sends entities OR markdown, rarely both, so this is safe).
+    entity_meta: list[dict] = []
+    for ent in (tg_entities or []):
+        rtype = _tg_entity_to_rubika_type(ent)
+        if not rtype:
+            continue
+        # ent.offset / ent.length are UTF-16 units into raw_text
+        # Map to clean text: subtract chars removed before this offset
+        raw_before  = raw_text.encode("utf-16-le")[: ent.offset * 2].decode("utf-16-le")
+        clean_before = _strip_raw_markdown(raw_before)
+        clean_start_u16 = _utf16_len(clean_before)
+
+        raw_span    = raw_text.encode("utf-16-le")[ent.offset * 2 : (ent.offset + ent.length) * 2].decode("utf-16-le")
+        clean_span  = _strip_raw_markdown(raw_span)
+        clean_len_u16 = _utf16_len(clean_span)
+
+        if clean_len_u16 > 0:
+            entity_meta.append({
+                "type":       rtype,
+                "from_index": base_offset + clean_start_u16,
+                "length":     clean_len_u16,
+            })
+
+    all_meta = struct_meta + entity_meta
+    return plain_body, all_meta
+
+
+def format_message(
+    raw_text: str,
+    channel_name: str,
+    timestamp: datetime,
+    tg_entities: Optional[list] = None,
+) -> tuple[str, Optional[dict]]:
+    """
+    Build a polished Rubika message using the Metadata API.
+
+    Final layout (no raw markdown chars anywhere):
+        ―――――――――――――――――――――――――
+        📡  Channel Name          ← Bold via metadata
+        🕐  2026-05-16 · 11:30    ← Italic via metadata
+        ―――――――――――――――――――――――――
+        body text…
+        vpn://config              ← Mono + Quote via metadata
+
+    Returns (plain_text, metadata_dict | None)
+    """
+    ts_str = timestamp.strftime("%Y-%m-%d · %H:%M UTC")
+
+    # Prefixes — plain chars, no markdown
+    ch_pre = "📡  "
+    ts_pre = "🕐  "
+    div    = DIVIDER
+
+    # Assemble header as a single string
+    # Format:  <div>\n<ch_pre><name>\n<ts_pre><ts>\n<div>
+    header = f"{div}\n{ch_pre}{channel_name}\n{ts_pre}{ts_str}\n{div}"
+
+    meta: list[dict] = []
+    cur = 0   # UTF-16 cursor through full message
+
+    # div + \n
+    cur += _utf16_len(div) + 1
+
+    # ch_pre then channel_name (Bold)
+    cur += _utf16_len(ch_pre)
+    ch_u16 = _utf16_len(channel_name)
+    if ch_u16:
+        meta.append({"type": "Bold", "from_index": cur, "length": ch_u16})
+    cur += ch_u16 + 1   # +1 for \n
+
+    # ts_pre then ts_str (Italic)
+    cur += _utf16_len(ts_pre)
+    ts_u16 = _utf16_len(ts_str)
+    if ts_u16:
+        meta.append({"type": "Italic", "from_index": cur, "length": ts_u16})
+    cur += ts_u16 + 1   # +1 for \n
+
+    # second div (no trailing \n here — the \n before body counts below)
+    cur += _utf16_len(div)
+
+    # Body (only if non-empty)
+    if raw_text and raw_text.strip():
+        # separator \n between header and body
+        cur += 1
+        body_plain, body_meta = _build_body(raw_text, tg_entities or [], cur)
+        full_text = header + "\n" + body_plain
+        meta.extend(body_meta)
+    else:
+        full_text = header
+
+    # Rubika hard cap: 30 metadata parts
+    meta = meta[:30]
+    metadata = {"meta_data_parts": meta} if meta else None
+    return full_text, metadata
 
 
 # ══════════════════════════════════════════════════════════════
 # WELCOME MESSAGE
 # ══════════════════════════════════════════════════════════════
 
-WELCOME_TEXT = """\
-🌐 **به ربات VPN خوش آمدید!**
-━━━━━━━━━━━━━━━━━━━━━━━
-سلام! 👋 شما با موفقیت عضو شدید.
+def _make_welcome() -> tuple[str, dict]:
+    """Build welcome message text + correctly computed Rubika metadata."""
+    div = "―――――――――――――――――――――――――"
+    title_text  = "خوش آمدید به ربات VPN"
+    footer_text = "اتصال امن  •  اینترنت آزاد  🚀"
 
-✅ از این پس بهترین کانفیگ‌های VPN و پروکسی را مستقیماً اینجا دریافت خواهید کرد.
+    lines = [
+        div,
+        f"🌐  {title_text}",
+        div,
+        "",
+        "سلام! 👋 شما با موفقیت عضو شدید.",
+        "",
+        "✅ از این پس بهترین کانفیگ‌های VPN",
+        "و پروکسی را مستقیماً اینجا دریافت می‌کنید.",
+        "",
+        "📌 نحوه استفاده:",
+        "• کانفیگ‌ها با فرمت‌بندی ویژه ارسال می‌شوند",
+        "• روی هر لینک ضربه بزنید تا کپی شود",
+        "• آپدیت‌ها بلافاصله پس از انتشار می‌رسند",
+        "",
+        div,
+        f"🔐  {footer_text}",
+    ]
+    full = "\n".join(lines)
 
-📌 **نحوه استفاده:**
-• کانفیگ‌ها با قالب‌بندی ویژه ارسال می‌شوند
-• کافیست روی هر لینک ضربه بزنید تا کپی شود
-• آپدیت‌ها بلافاصله پس از انتشار ارسال می‌شوند
+    def u16(s): return len(s.encode("utf-16-le")) // 2
 
-━━━━━━━━━━━━━━━━━━━━━━━
-🔐 _اتصال امن، اینترنت آزاد_ 🚀\
-"""
+    # Find UTF-16 offset of title_text inside the full string
+    title_line = f"🌐  {title_text}"
+    pre_title  = "\n".join(lines[:1]) + "\n" + "🌐  "
+    off_title  = u16(pre_title)
+    len_title  = u16(title_text)
+
+    # Find UTF-16 offset of footer_text
+    pre_footer = "\n".join(lines[:-1]) + "\n" + "🔐  "
+    off_footer = u16(pre_footer)
+    len_footer = u16(footer_text)
+
+    meta = {"meta_data_parts": [
+        {"type": "Bold",   "from_index": off_title,  "length": len_title},
+        {"type": "Italic", "from_index": off_footer, "length": len_footer},
+    ]}
+    return full, meta
+
+WELCOME_TEXT, WELCOME_META = _make_welcome()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -496,7 +697,7 @@ async def poll_subscribers(session: aiohttp.ClientSession):
             log.info("New subscriber: %s", chat_id)
             subscribers.add(chat_id)
             changed = True
-            await rubika_send_message(chat_id, WELCOME_TEXT, session)
+            await rubika_send_message(chat_id, WELCOME_TEXT, session, metadata=WELCOME_META)
 
     if changed:
         save_subscribers()
@@ -651,19 +852,23 @@ async def handle_tg_message(tg_client: TelegramClient, msg,
     if not subscribers:
         return
 
-    ts       = msg.date.astimezone(timezone.utc)
-    raw_text = msg.text or msg.message or ""
-    caption  = format_message(raw_text, channel_name, ts)
+    ts          = msg.date.astimezone(timezone.utc)
+    raw_text    = msg.text or msg.message or ""
+    tg_entities = msg.entities or []
+
+    # format_message uses Telethon entities (not regex) for Bold/Italic/Mono
+    caption, metadata = format_message(raw_text, channel_name, ts, tg_entities)
 
     if msg.media:
+        # Media: send caption as plain text — metadata offsets don't apply to file captions
         pairs = await forward_media(tg_client, msg, caption, session)
     else:
         if not raw_text.strip():
             return
-        pairs = await broadcast_text(caption, session)
+        pairs = await broadcast_text(caption, session, metadata=metadata)
         log.info("Forwarded text to %d subscribers", len(pairs))
 
-    # Schedule reaction updates in background
+    # Schedule reaction updates in background (text messages only)
     if pairs and (msg.media is None):
         asyncio.create_task(
             schedule_reaction_update(
