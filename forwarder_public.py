@@ -269,23 +269,33 @@ async def rubika_upload_file(file_bytes: bytes, file_type: str,
         log.error("No upload_url in response")
         return None
 
-    # Step 2: POST raw file bytes (Rubika upload endpoint expects raw body, not multipart)
+    # Step 2: POST as multipart/form-data with field name "file"
+    # Rubika docs: file must be sent in the request body as multipart
+    import json as _json
     try:
+        form = aiohttp.FormData()
+        form.add_field("file", file_bytes, filename="upload",
+                       content_type="application/octet-stream")
         async with session.post(
             upload_url,
-            data=file_bytes,
-            headers={"Content-Type": "application/octet-stream"},
+            data=form,
             timeout=aiohttp.ClientTimeout(total=120),
         ) as r:
             raw = await r.read()
-            # Rubika may return empty body on success OR JSON with file_id
+
+            # HTML response = nginx/server error (wrong method, bad URL, etc.)
+            if raw.lstrip().startswith(b"<"):
+                log.error("Upload got HTML error (HTTP %s) — wrong format or URL expired",
+                          r.status)
+                return None
+
+            # Empty or null body → file accepted; extract token from URL path
             if not raw or raw.strip() in (b"", b"null"):
-                # Empty / null body = upload accepted; file_id comes from URL path
-                # Extract token from upload_url as file_id (last path segment)
                 file_id = upload_url.rstrip("/").split("/")[-1]
-                log.info("Upload succeeded (empty body); using URL token as file_id")
+                log.info("Upload OK (empty body) — file_id: %s", file_id)
                 return file_id
-            import json as _json
+
+            # JSON response
             try:
                 data = _json.loads(raw)
                 file_id = (
@@ -293,17 +303,18 @@ async def rubika_upload_file(file_bytes: bytes, file_type: str,
                     or (data.get("data") or {}).get("file_id")
                 )
                 if file_id:
+                    log.info("Upload OK — file_id: %s", file_id)
                     return file_id
-                log.error("Upload response missing file_id: %s", data)
+                log.error("Upload: no file_id in JSON response: %s", data)
             except _json.JSONDecodeError:
-                # Non-JSON body — treat the raw text as file_id if it looks like one
                 token = raw.decode(errors="replace").strip()
-                if token and len(token) < 200:
-                    log.info("Upload: using raw response as file_id: %s", token)
+                # Some Rubika servers return just the file_id token as plain text
+                if token and len(token) < 200 and " " not in token and not token.startswith("<"):
+                    log.info("Upload OK — plain-text file_id: %s", token)
                     return token
-                log.error("Unreadable upload response: %r", raw[:200])
+                log.error("Upload unreadable response (HTTP %s): %r", r.status, raw[:200])
     except Exception as e:
-        log.error("File upload error: %s", e)
+        log.error("File upload exception: %s", e)
     return None
 
 
@@ -476,13 +487,21 @@ def _build_body(
     for line in lines:
         s = line.strip()
         if s and VPN_SCHEMES.match(s):
+            # VPN/IP line — goes into the shared buffer regardless of what came before
             vpn_buf.append(s)
         else:
             flush_vpn()
-            # Keep empty lines so paragraphs are preserved
             segments.append((s, []))
 
     flush_vpn()
+
+    # Strip leading/trailing empty plain segments so that IP blocks at the
+    # start or end of a message aren't preceded/followed by a blank line
+    # that would visually separate the first IP from the rest of the block
+    while segments and segments[0] == ("", []):
+        segments.pop(0)
+    while segments and segments[-1] == ("", []):
+        segments.pop()
 
     # 3. Stitch segments → plain_body + structural (VPN) meta
     plain_parts: list[str] = []
@@ -715,26 +734,30 @@ async def schedule_reaction_update(tg_client: TelegramClient,
                                     rubika_pairs: list,
                                     tg_channel, tg_msg_id: int,
                                     original_text: str,
+                                    original_metadata: Optional[dict],
                                     session: aiohttp.ClientSession):
-    """Background task that edits Rubika messages with reaction counts."""
+    """
+    Background task: fetch TG reactions periodically and edit Rubika messages
+    to append emoji counts. CRITICAL: resend original_metadata on every edit —
+    editMessageText wipes all formatting (Mono/Quote/Bold) unless metadata is
+    explicitly included again.
+    """
     send_time = time.monotonic()
-    key = f"{tg_channel}_{tg_msg_id}"
 
     for delay in REACTION_SCHEDULE:
-        await asyncio.sleep(delay - (time.monotonic() - send_time))
+        remaining = delay - (time.monotonic() - send_time)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
         try:
             msgs = await tg_client.get_messages(tg_channel, ids=[tg_msg_id])
             if not msgs or not msgs[0]:
                 break
             msg = msgs[0]
             reactions = getattr(msg, "reactions", None)
-            if reactions:
-                top = sorted(
-                    reactions.results or [],
-                    key=lambda r: r.count, reverse=True
-                )[:3]
+            if reactions and reactions.results:
+                top = sorted(reactions.results, key=lambda r: r.count, reverse=True)[:3]
                 reaction_str = "  ".join(
-                    f"{getattr(r.reaction, 'emoticon', '👍')} {r.count}"
+                    f"{getattr(r.reaction, 'emoticon', '❤️')} {r.count}"
                     for r in top
                 )
                 new_text = original_text + f"\n\n{reaction_str}"
@@ -742,7 +765,11 @@ async def schedule_reaction_update(tg_client: TelegramClient,
                 new_text = original_text
 
             for chat_id, msg_id in rubika_pairs:
-                await rubika_edit_message(chat_id, msg_id, new_text, session)
+                # Always resend original_metadata — without it, Rubika strips
+                # all formatting (Mono, Quote, Bold) from the edited message
+                await rubika_edit_message(chat_id, msg_id, new_text, session,
+                                          metadata=original_metadata)
+            log.debug("Reaction edit done for tg_msg %s", tg_msg_id)
         except Exception as e:
             log.debug("Reaction update error: %s", e)
             break
@@ -872,7 +899,10 @@ async def handle_tg_message(tg_client: TelegramClient, msg,
     if pairs and (msg.media is None):
         asyncio.create_task(
             schedule_reaction_update(
-                tg_client, pairs, entity, msg.id, caption, session
+                tg_client, pairs, entity, msg.id,
+                caption,    # plain text — resent on every edit
+                metadata,   # original formatting — must be resent or Mono/Quote vanish
+                session,
             )
         )
 
